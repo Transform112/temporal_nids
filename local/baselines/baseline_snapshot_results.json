@@ -1,0 +1,39 @@
+{
+  "model": "E-GraphSAGE-60s-snapshot",
+  "dataset": "CIC-IDS2017",
+  "seed": 42,
+  "window_sec": 60,
+  "hidden_dim": 128,
+  "out_dim": 64,
+  "node_feature_dim": 4,
+  "edge_feature_dim": 26,
+  "train_epochs": 10,
+  "train_time_sec": 3.2,
+  "train_graphs": 15,
+  "val_graphs": 4,
+  "test_graphs": 4,
+  "val": {
+    "roc_auc": 0.6184087564842652,
+    "pr_auc": 0.32152596685701906,
+    "best_f1": 0.40198287516899506,
+    "best_threshold": 7223674925331.812,
+    "precision": 0.5769728331177232,
+    "recall": 0.3084370677731674,
+    "fpr": 0.05439121756487026,
+    "total_edges": 7458,
+    "attack_edges": 1446,
+    "benign_edges": 6012
+  },
+  "test": {
+    "roc_auc": 0.6325648219211307,
+    "pr_auc": 0.3467197984019579,
+    "best_f1": 0.435084672166739,
+    "best_threshold": 7765608716141.038,
+    "precision": 0.6185185185185185,
+    "recall": 0.33556597454789017,
+    "fpr": 0.051802179379715006,
+    "total_edges": 7458,
+    "attack_edges": 1493,
+    "benign_edges": 5965
+  }
+}

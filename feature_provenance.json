@@ -94,10 +94,11 @@
     "cic17_source": "Flow IAT Std",
     "unsw_source": "DERIVED",
     "transform": "unsw_avg_sjit_djit",
-    "notes": "Jitter \u2260 std(IAT); flagged as approximation in paper",
+    "notes": "Jitter \u2260 std(IAT); flagged as approximation in paper. DROPPED: jitter proxy is wrong signal, not just different \u2014 actively harmful for cross-dataset training.",
     "is_imputed": false,
     "verified": true,
-    "mismatch": null
+    "mismatch": null,
+    "dropped": true
   },
   {
     "common_name": "mean_pkt_len",
@@ -114,20 +115,22 @@
     "cic17_source": "SYN Flag Count",
     "unsw_source": "DERIVED",
     "transform": "impute_zero_and_flag",
-    "notes": "SYN flag count not available in UNSW-NB15 -- impute 0 + is_imputed flag",
+    "notes": "SYN flag count not available in UNSW-NB15 -- impute 0 + is_imputed flag. DROPPED: constant 0 for UNSW = dataset-identity signal (leakage).",
     "is_imputed": true,
     "verified": true,
-    "mismatch": null
+    "mismatch": null,
+    "dropped": true
   },
   {
     "common_name": "ack_count",
     "cic17_source": "ACK Flag Count",
     "unsw_source": "DERIVED",
     "transform": "impute_zero_and_flag",
-    "notes": "ACK flag count not available in UNSW-NB15 -- impute 0 + is_imputed flag",
+    "notes": "ACK flag count not available in UNSW-NB15 -- impute 0 + is_imputed flag. DROPPED: constant 0 for UNSW = dataset-identity signal (leakage).",
     "is_imputed": true,
     "verified": true,
-    "mismatch": null
+    "mismatch": null,
+    "dropped": true
   },
   {
     "common_name": "init_win_fwd",
