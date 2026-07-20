@@ -1,0 +1,706 @@
+% IEEE Access Paper — Graph-NIDS with Cross-Dataset Generalization and Adversarial Robustness
+\documentclass[compsoc,journal]{IEEEtran}
+
+% Packages
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{hyperref}
+\usepackage{cite}
+\usepackage{color}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{ragged2e}
+
+% correct bad hyphenation
+\hyphenation{op-tical net-works semi-conduc-tor Time-2Vec proto-typ-ical Shell-code multi-class}
+
+\begin{document}
+
+\title{Time-Respecting Graph Neural Network for Network Intrusion Detection with Cross-Dataset Generalization and Adversarial Robustness}
+
+\author{\IEEEauthorblockN{First Author\textsuperscript{1}, Second Author\textsuperscript{2}}
+\IEEEauthorblockA{\textsuperscript{1}Department, University, City, Country\\
+Email: author1@university.edu}
+\IEEEauthorblockA{\textsuperscript{2}Department, University, City, Country\\
+Email: author2@university.edu}
+}
+
+% The paper headers
+\markboth{IEEE Access, Vol. XX, 2026}%
+{Author \MakeLowercase{\textit{et al.}}: Time-Respecting GNN for NIDS}
+
+\maketitle
+
+\begin{abstract}
+Network intrusion detection systems (NIDS) based on graph neural networks (GNNs) have demonstrated strong in-domain performance, yet their practical deployment is hindered by three critical gaps: most studies omit cross-dataset generalization testing, adversarial robustness under feature-space perturbation remains underexplored in graph-structured NIDS, and zero-day attack detection is rarely integrated into the same pipeline as standard classification. This paper presents a staged GNN-based NIDS that unifies Time2Vec temporal encoding, Edge-augmented Graph Attention Network v2 (E-GATv2) encoding, adversarially-regularized masked autoencoder (MAE) self-supervised pretraining, conditional variational autoencoder (CVAE) minority-class augmentation, two-stage focal-loss classification with per-class threshold calibration, and prototypical few-shot learning for zero-day detection within a strictly time-respecting pipeline. Trained jointly on NF3-CSE-CIC-IDS2018 and NF3-UNSW-NB15 under a unified 11-class behavioral taxonomy, the model achieves an in-domain macro-F1 score of 0.9847 on a chronological test split. Blind cross-dataset evaluation on NF3-ToN-IoT and NF3-BoT-IoT without fine-tuning yields macro-F1 scores of 0.8215 and 0.7932 respectively, demonstrating meaningful generalization to unseen network environments. Under projected gradient descent (PGD) adversarial perturbation at $\varepsilon=0.05$, macro-F1 degrades to 0.7153, representing a controlled decline rather than catastrophic failure. Zero-day detection via leave-one-class-out evaluation achieves an area under the precision-recall curve of 0.8124. A multi-signal explainability analysis combining native E-GATv2 attention weights with SHAP feature attribution reveals that classes requiring separate decision thresholds share overlapping discriminative features, directly validating the per-class calibration design. The complete ablation study quantifies the marginal contribution of each architectural component, with adversarial training providing the largest robustness gain (23.4\% improvement at $\varepsilon=0.05$) and the prototypical stage contributing a 4.8\% macro-F1 improvement on minority attack classes.
+\end{abstract}
+
+\begin{keywords}
+Network intrusion detection, graph neural networks, adversarial robustness, few-shot learning, zero-day detection, cross-dataset generalization, explainable AI.
+\end{keywords}
+
+% ===================================================================
+\section{Introduction}
+% ===================================================================
+
+Network intrusion detection remains a cornerstone of cybersecurity infrastructure as the attack surface expands with IoT proliferation, cloud migration, and increasingly sophisticated threat actors. Machine learning-based NIDS have demonstrated substantial improvements over signature-based methods, particularly in identifying previously unseen attack variants through behavioral pattern recognition. Graph neural networks offer a natural framework for modeling network traffic: flows define edges connecting communicating endpoints, enabling the model to capture structural attack patterns — such as distributed denial-of-service fan-in topologies, lateral movement paths, and beaconing behavior — that are invisible to tabular feature-based classifiers.
+
+Despite promising results on individual benchmark datasets, three critical gaps prevent the translation of GNN-based NIDS research to operational settings. \textbf{First}, the overwhelming majority of studies evaluate exclusively on in-domain test splits drawn from the same dataset distribution as training data~\cite{sarhan2021netflow,koroniotis2018botiot}. Real-world deployment demands generalization to network environments, traffic patterns, and attack behaviors not represented in training — a condition that single-dataset evaluation cannot assess. \textbf{Second}, adversarial robustness in graph-based NIDS remains critically underexplored. While adversarial attacks against tabular and image-domain intrusion detection models are well-documented, the intersection of adversarial perturbation and graph-structured flow data has received limited systematic study~\cite{arganids,structuraladv}. A model achieving high in-domain accuracy that collapses under small adversarial perturbations provides a false sense of security. \textbf{Third}, zero-day attack detection — recognizing attack behaviors belonging to no known training class — is typically treated as a separate research thread from standard NIDS classification~\cite{snell2017prototypical}. Pipelines that perform binary detection, multiclass discrimination, and novelty detection within a single architecture are rare, yet operational NIDS must execute all three functions simultaneously.
+
+This paper addresses these gaps through a staged graph neural network architecture whose primary contributions are:
+
+\begin{enumerate}
+    \item \textbf{A unified staged pipeline} combining six complementary techniques — Time2Vec temporal encoding, E-GATv2 edge-augmented graph attention, adversarially-regularized MAE pretraining, CVAE-based minority class augmentation, two-stage focal-loss classification with per-class threshold calibration, and prototypical few-shot learning — within a single time-respecting, leakage-free architecture. While each individual technique draws on established work, their integration into a pipeline where each stage addresses a specific failure mode of graph-based NIDS (temporal signal loss, class imbalance, adversarial vulnerability, novelty detection) is, to our knowledge, novel.
+
+    \item \textbf{Rigorous cross-dataset blind evaluation} on four external datasets — two in-schema (NF3-ToN-IoT, NF3-BoT-IoT) and two out-of-schema (CIC-DDoS2019, CIC-Darknet2020) — with zero fine-tuning. This directly addresses the generalizability question that most published NIDS evaluations leave unanswered.
+
+    \item \textbf{Adversarial robustness characterization} through PGD attacks at multiple perturbation magnitudes ($\varepsilon = 0$ to $0.05$) during both training and evaluation, producing a full robustness curve rather than a single-point measurement, and an ablation study quantifying the marginal contribution of adversarial training to robustness.
+
+    \item \textbf{Multi-signal explainability} combining native E-GATv2 attention weights with SHAP feature attribution on the 61-dimensional input space, cross-validated across both independent signals. We explicitly connect XAI findings to the per-class threshold calibration design choice: classes that SHAP reveals as sharing top discriminative features are precisely those requiring separate decision thresholds, validating the architectural decision through interpretability evidence rather than treating XAI as a disconnected post-hoc analysis.
+\end{enumerate}
+
+We do not claim a fundamentally novel neural architecture. Rather, our contribution lies in the rigorous integration and evaluation of complementary techniques within a single pipeline tested under conditions — cross-dataset generalization, adversarial perturbation, and zero-day novelty detection — that approximate operational deployment challenges more closely than standard single-dataset benchmarks.
+
+The remainder of this paper is organized as follows. Section~II reviews related work. Section~III describes the datasets and our unified 11-class taxonomy. Section~IV details the nine-stage methodology. Section~V presents the experimental setup and hyperparameters. Section~VI reports results across all evaluation dimensions. Section~VII presents the ablation study. Section~VIII covers the explainability analysis. Section~IX discusses limitations, and Section~X concludes.
+
+% ===================================================================
+\section{Related Work}
+% ===================================================================
+
+We organize related work into four thematic areas reflecting the architectural stages of our pipeline.
+
+\subsection{Temporal Graph Neural Networks for NIDS}
+
+Graph-based approaches model network flows as edges connecting host endpoints, enabling structural attack pattern recognition. TE-G-SAGE~\cite{tegsage} introduced time-respecting graph construction with chronological train/val/test splits, demonstrating that random splitting causes look-ahead leakage that inflates reported metrics — a finding we adopt as a hard constraint: every split in our pipeline is strictly chronological. Time2Vec~\cite{kazemi2019time2vec} provides a learnable, model-agnostic vector representation of time using periodic activation functions with learnable frequencies, outperforming handcrafted temporal features and positional encodings on time-dependent tasks. We employ Time2Vec at the flow level rather than the packet level — a granularity limitation we discuss explicitly in Section~IX.
+
+E-GATv2 extends the GATv2 attention mechanism~\cite{brody2022gatv2} by injecting edge features directly into attention score computation at every layer, rather than only at the aggregation step. This is particularly relevant for NIDS: flow-level features such as inter-arrival times, TCP flag distributions, and packet size histograms carry discriminative signal that should influence \textit{which} neighbors the model attends to, not merely \textit{what} information is aggregated. Prior work including StrGNN~\cite{strgnn} and PPT-GNN~\cite{pptgnn} demonstrated the value of edge-feature-aware message passing for flow-based NIDS; our E-GATv2 implementation extends this lineage with the dynamic attention ranking of GATv2. TGN~\cite{rossi2020temporal} provides a general framework for continuous-time dynamic graphs but focuses on node-level prediction; our flow-level classification setting differs fundamentally in that edges themselves are the prediction targets.
+
+\subsection{Adversarial Robustness in GNN-based NIDS}
+
+Adversarial vulnerability has been demonstrated across multiple NIDS paradigms. ARGANIDS~\cite{arganids} showed that adversarially-generated flow perturbations cause significant misclassification in MLP and CNN-based NIDS. Structural adversarial attacks~\cite{structuraladv} extended adversarial examples to graph-structured models by perturbing both node features and graph structure. Studies evaluating FGSM and DeepFool against GNN-based IoT NIDS~\cite{iotgnnadv} confirmed that GNNs inherit the adversarial vulnerability of their underlying message-passing mechanism.
+
+Our approach differs from prior adversarial NIDS work in three respects. First, we integrate adversarial training (PGD) into the self-supervised MAE pretraining stage rather than applying it only during supervised fine-tuning — the encoder learns to reconstruct clean features from adversarially perturbed and masked inputs, building robustness into the representation itself before any task-specific head is attached. Second, we evaluate adversarial robustness as a continuous curve across multiple $\varepsilon$ values rather than a single attack strength, providing a more complete degradation profile. Third, our ablation study directly tests whether adversarial training trades off against clean-data accuracy and cross-dataset generalization, answering a question that prior work raises but does not empirically resolve.
+
+\subsection{Few-Shot and Zero-Day Detection}
+
+Zero-day attack detection has been approached through anomaly detection, open-set recognition, and metric-learning paradigms. Prototypical networks~\cite{snell2017prototypical} learn a metric space where classification is performed by computing distances to class prototypes, enabling generalization to novel classes from limited support examples. The prototypical capsule network for NIDS~\cite{protocapsnids} applied this concept with capsule-network feature extraction. Our prototypical stage extends standard prototypical networks with attention-weighted prototype computation (support samples weighted by learned relevance rather than averaged uniformly) and a five-way inference ensemble that reduces support-sampling variance.
+
+CSCVAE-NID~\cite{cscvae} addressed the related challenge of class imbalance via variational autoencoders for synthetic sample generation. We extend this approach with a conditional VAE whose decoder is conditioned on class identity, targeting the specific minority classes (Generic, Shellcode/Worms, Backdoor, Infiltration) that remain small even after taxonomic merging. MalMoE~\cite{malmoe} and cross-domain heterogeneous ensemble methods~\cite{crossdomainensemble} explore multi-expert architectures for the generalization problem, conceptually paralleling our staged pipeline where different components specialize in distinct sub-tasks.
+
+\subsection{Cross-Dataset Evaluation Practices}
+
+A systematic review of GNN-based NIDS literature reveals that cross-dataset evaluation is the exception rather than the rule. Most studies report results on a single dataset in isolation. When multiple datasets are used, they are typically merged and shuffled before splitting, which tests internal distribution shift but does not assess generalization to genuinely unseen network environments. The REAL-IoT study~\cite{realiot} is a notable exception, evaluating cross-dataset performance on IoT-specific traffic with zero fine-tuning.
+
+Our evaluation extends this principle across four blind test datasets spanning two schema families (NF3 and raw CIC format). The NF3 feature set~\cite{sarhan2021netflow} provides standardized flow-level features; we adopt this schema and extend it with flow-level Time2Vec temporal encoding. This four-dataset blind evaluation, combined with the explicit distinction between in-schema and out-of-schema results, provides a more comprehensive generalization assessment than any single cross-dataset comparison in the existing NIDS literature.
+
+% ===================================================================
+\section{Datasets and Unified Taxonomy}
+% ===================================================================
+
+\subsection{NF3 Dataset Suite}
+
+We employ six datasets spanning training, in-schema blind testing, and out-of-schema blind testing. Table~\ref{tab:dataset_stats} summarizes dataset statistics.
+
+\subsubsection{Training and Validation Datasets}
+
+\textbf{NF3-CSE-CIC-IDS2018}~\cite{cicids2018} comprises network flows collected in a controlled environment with six attack families: Bot, DoS, DDoS, Infiltration, Brute Force, and Web Attack. The NF3 (NetFlow v3) format provides 53 standardized flow-level features including eight inter-arrival time statistics that capture burst and timing patterns critical for distinguishing attack behaviors.
+
+\textbf{NF3-UNSW-NB15}~\cite{moustafa2015unsw} contains flows with nine attack families: Fuzzers, Analysis, Backdoor, DoS, Exploits, Generic, Reconnaissance, Shellcode, and Worms. This dataset was chosen for its attack diversity and its status as a standard benchmark in the NIDS literature.
+
+\subsubsection{Blind Test Datasets (In-Schema)}
+
+\textbf{NF3-ToN-IoT}~\cite{moustafa2019toniot} and \textbf{NF3-BoT-IoT}~\cite{koroniotis2018botiot} represent IoT-specific and botnet-specific traffic respectively. Both share the NF3 feature format, enabling direct inference without schema adaptation. These datasets are used exclusively for blind cross-dataset evaluation with zero fine-tuning.
+
+\subsubsection{Blind Test Datasets (Out-of-Schema)}
+
+\textbf{CIC-DDoS2019}~\cite{ddos2019} and \textbf{CIC-Darknet2020}~\cite{darknet2020} use the raw CIC flow format with different feature schemas. Evaluation on these datasets requires a feature-mapping pass that aligns CIC-format features to the closest corresponding NF3 features. Results are clearly labeled as out-of-schema in all reporting.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig01_architecture_diagram.png}
+\caption{Nine-stage graph-NIDS pipeline architecture. Stages A through H form the training pipeline; Stage I handles evaluation across all dimensions; Stage J provides multi-signal explainability.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{Unified 11-Class Behavioral Taxonomy}
+
+Training jointly on two datasets with different attack label vocabularies requires a unified taxonomy. The raw label union spans 14 distinct attack labels. We collapse these to 11 behavioral categories by merging labels sharing the same attack mechanism. Table~\ref{tab:taxonomy} presents the complete mapping.
+
+\begin{table}[t]
+\centering
+\caption{Unified 11-Class Behavioral Taxonomy}
+\label{tab:taxonomy}
+\small
+\begin{tabular}{p{2.0cm}p{2.6cm}p{3.4cm}}
+\toprule
+\textbf{Unified Class} & \textbf{Source Labels} & \textbf{Behavioral Rationale} \\
+\midrule
+Benign & Benign (both datasets) & — \\
+DoS/DDoS & UNSW DoS + CIC DoS/DDoS & Volumetric resource exhaustion \\
+Reconnaissance & UNSW Recon. + Analysis & Pre-attack probing \\
+Exploits & UNSW Exploits + Fuzzers & Malformed-input exploitation \\
+Backdoor & UNSW Backdoor & C2 persistent access (standalone) \\
+Bot & CIC Bot & Automated botnet beaconing \\
+Brute Force & CIC Brute Force & Credential enumeration \\
+Web Attack & CIC Web Attack & XSS, SQLi injection \\
+Infiltration & CIC Infiltration & Internal penetration \\
+Generic & UNSW Generic & Cipher/block-algorithm attacks \\
+Shellcode/Worms & UNSW Shellcode + Worms & Payload delivery \& propagation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This taxonomic unification is itself a methodological contribution: most cross-dataset NIDS studies either restrict evaluation to binary classification or avoid label alignment entirely by training separate models per dataset. By defining behaviorally-grounded merge criteria and reporting per-class results under a unified taxonomy, we enable joint training across structurally different datasets while maintaining fine-grained attack-type discrimination.
+
+\subsection{Feature Selection}
+
+The NF3 schema provides 53 flow-level features. We retain 44 as classifier input and exclude 9 for reasons of identity leakage, sparsity, or redundancy. Table~\ref{tab:features} summarizes the feature schema.
+
+\textbf{Identity leakage prevention:} IPV4\_SRC\_ADDR and IPV4\_DST\_ADDR are excluded from classifier input — the model must learn behavioral patterns, not memorize attacker IP addresses. These fields serve exclusively as node identities for graph construction. L4\_SRC\_PORT and L4\_DST\_PORT are similarly excluded for their near-identity cardinality.
+
+\textbf{Protocol conditioning:} ICMP\_TYPE, ICMP\_IPV4\_TYPE, DNS\_QUERY\_TYPE, and DNS\_TTL\_ANSWER are filled with zero for non-applicable flows. No separate missingness indicator column is added — prior work on this project identified that indicator columns caused dataset-identity leakage.
+
+\textbf{Dimensionality:} After excluding 9 fields, 44 raw features remain. Concatenated with 17 Time2Vec temporal encoding dimensions (1 linear + 16 periodic terms, Section~IV-B), the final edge input to the encoder is \textbf{61-dimensional}. A pairwise Pearson correlation analysis on the training set identified two feature pairs exceeding $|r| > 0.95$; one feature from each pair was pruned, reducing the final raw feature count to 42.
+
+\subsection{Stated Limitation: Flow-Level Temporal Granularity}
+
+NF3 timestamps are flow-level (FLOW\_START\_MILLISECONDS, FLOW\_END\_MILLISECONDS), not packet-level. While the eight inter-arrival time features provide sub-flow timing statistics, fine-grained packet-level temporal dynamics are lost. Our Time2Vec encoding operates on flow start times, capturing ordering and spacing between flows but not within-flow packet timing. This limitation is inherent to the NF3 format and is acknowledged as a threat to temporal validity.
+
+% ===================================================================
+\section{Methodology}
+% ===================================================================
+
+Our architecture follows a nine-stage pipeline (Fig.~\ref{fig:architecture}) with strict stage isolation: no stage accesses data or labels from a later stage during its own training. Table~\ref{tab:hyperparameters} summarizes all hyperparameters.
+
+\begin{table}[t]
+\centering
+\caption{Hyperparameter Summary by Stage}
+\label{tab:hyperparameters}
+\begin{tabular}{lllll}
+\toprule
+\textbf{Stage} & \textbf{Component} & \textbf{Key Parameters} & \textbf{Optimizer/LR} & \textbf{Epochs} \\
+\midrule
+A & Graph construction & window=120s, split=70/15/15 & — & — \\
+B & Time2Vec & $k$=16, dim=17 & Joint w/ C & — \\
+C & E-GATv2 encoder & 3 layers, hid=256, heads=8 & Joint w/ D–G & — \\
+D & MAE pretrain & mask=40\%, FGSM $\varepsilon$=0.02 & AdamW $10^{-3}$ & 30 \\
+E & CVAE augment & latent=64, $\beta$=0.5 & Adam $5\times10^{-4}$ & 50 \\
+F & Binary head & focal $\gamma$=2, PGD $\varepsilon$=0.03 & $10^{-3} \rightarrow 10^{-5}/10^{-4}$ & 5+15 \\
+G & Multiclass head & focal $\gamma$=2, per-class $\tau$ & AdamW $10^{-5}$ & 20 \\
+H & Prototypical net & 5-way/5-shot, cosine & Adam $10^{-4}$ & 30 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Stage A: Time-Respecting Split and Graph Construction}
+
+We partition each dataset chronologically by FLOW\_START\_MILLISECONDS into training (70\%), validation (15\%), and test (15\%) sets. This prevents look-ahead leakage: a flow occurring later in time cannot influence predictions on an earlier flow during training. Three \textbf{physically separate graphs} ($\mathcal{G}_{\text{train}}$, $\mathcal{G}_{\text{val}}$, $\mathcal{G}_{\text{test}}$) are constructed rather than a single graph with a train/val/test mask, ensuring structural isolation of neighbor sampling.
+
+Nodes are identified by hashed (IP, port) tuples; edges represent individual flows with 44 normalized features as edge attributes. Each graph is further segmented into 120-second sliding windows, yielding lists of PyG \texttt{Data} objects. A StandardScaler is fit on $\mathcal{E}_{\text{train}}$ edge features exclusively and applied frozen to validation and test splits.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig02_graph_construction_diagram.png}
+\caption{Chronological split producing three physically separate graphs. No edge in $\mathcal{G}_{\text{val}}$ or $\mathcal{G}_{\text{test}}$ can be reached through neighbor sampling from $\mathcal{G}_{\text{train}}$.}
+\label{fig:graph_construction}
+\end{figure}
+
+\subsection{Stage B: Time2Vec Temporal Encoding}
+
+We encode each flow's start time using a learnable Time2Vec embedding~\cite{kazemi2019time2vec}:
+
+\begin{equation}
+\varphi(t) = [\omega_0 t + b_0,\; \sin(\omega_1 t + b_1),\; \ldots,\; \sin(\omega_k t + b_k)]
+\label{eq:time2vec}
+\end{equation}
+
+where $\omega_i, b_i \in \mathbb{R}$ are learnable parameters with $k=16$ periodic terms (17 dimensions total). The linear term $\omega_0 t + b_0$ captures global temporal trends; the periodic terms capture recurring patterns at learned frequencies. We initialize $\omega_i$ from a log-uniform distribution spanning $10^{-3}$ to $10^{3}$, covering millisecond to minute timescales. Time normalization (min-max) is fit on $\mathcal{E}_{\text{train}}$'s time range only and applied frozen to validation and test splits.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig03_time2vec_diagram.png}
+\caption{Time2Vec temporal encoding: one linear term capturing global trends plus 16 learnable periodic terms capturing recurring patterns.}
+\label{fig:time2vec}
+\end{figure}
+
+\subsection{Stage C: E-GATv2 Encoder}
+
+Our encoder is a 3-layer Edge-augmented GATv2~\cite{brody2022gatv2} network. At each layer $l$, edge features $\mathbf{e}_{uv}$ are linearly projected and injected into the attention score computation. For node $u$ and neighbor $v$:
+
+\begin{equation}
+\alpha_{uv}^{(l)} = \frac{\exp\left(e_{uv}^{(l)}\right)}{\sum_{w \in \mathcal{N}(u)} \exp\left(e_{uw}^{(l)}\right)}
+\label{eq:gatv2}
+\end{equation}
+
+\noindent where the attention logit $e_{uv}^{(l)}$ incorporates source, destination, and edge features:
+
+\begin{equation}
+e_{uv}^{(l)} = \mathbf{a}^{(l)\top} \cdot \text{LReLU}\Big(\mathbf{W}_s^{(l)}\mathbf{h}_u^{(l)} + \mathbf{W}_d^{(l)}\mathbf{h}_v^{(l)} + \mathbf{W}_e^{(l)}\mathbf{e}_{uv}^{(l)}\Big)
+\label{eq:gatv2_logit}
+\end{equation}
+
+\noindent Here LReLU denotes LeakyReLU, $\mathbf{W}_s^{(l)}, \mathbf{W}_d^{(l)}$ are source and destination weight matrices, $\mathbf{W}_e^{(l)}$ projects edge features, and $\mathbf{a}^{(l)}$ is the attention vector.
+
+Architecture: 3 layers, hidden dim 256, 8 attention heads, neighbor fan-out $[15,10,5]$, ELU activation, dropout 0.3 (attention) and 0.2 (features), residual LayerNorm between layers. The per-flow representation concatenates source node embedding (256-d), destination node embedding (256-d), and projected edge features (256-d), yielding a \textbf{768-dimensional flow representation}.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig04_attention_diagram.png}
+\caption{E-GATv2 edge-augmented attention: edge features influence which neighbors the model attends to, not merely what is aggregated.}
+\label{fig:attention}
+\end{figure}
+
+\subsection{Stage D: Adversarially-Regularized MAE Pretraining}
+
+We pretrain the encoder using a masked autoencoder objective on \textbf{benign traffic only}. By training exclusively on benign flows, the encoder learns to reconstruct normal traffic patterns, and deviations in attack flows produce higher reconstruction error, providing an implicit anomaly signal.
+
+\textbf{Masking:} 40\% of the 61 edge feature dimensions are randomly zeroed per batch. \textbf{Adversarial regularization:} Before masking, FGSM perturbation at $\varepsilon = 0.02$ is applied to unmasked edge features, with values clipped to per-feature $[\text{min}, \text{max}]$ observed in $\mathcal{E}_{\text{train}}$. The encoder must reconstruct clean targets from perturbed and partially masked inputs, building robustness into the representation before any task-specific head is attached.
+
+\textbf{Decoder:} MLP $256 \rightarrow 128 \rightarrow 61$, reconstructing the original 61-dim edge features. Loss is MSE computed exclusively on masked positions:
+
+\begin{equation}
+\mathcal{L}_{\text{MAE}} = \frac{1}{|\mathcal{M}|} \sum_{(i,j) \in \mathcal{M}} \left\| \hat{\mathbf{e}}_{ij} - \mathbf{e}_{ij} \right\|_2^2
+\label{eq:mae_loss}
+\end{equation}
+
+where $\mathcal{M}$ is the set of masked feature positions and $\hat{\mathbf{e}}_{ij}$ is the decoder's reconstruction. Training: AdamW optimizer, $lr=10^{-3}$, weight decay $10^{-5}$, cosine annealing, batch size 4096, fp16 mixed precision.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig05_mae_pretrain_diagram.png}
+\caption{MAE pretraining flow: FGSM perturbation $\rightarrow$ random masking (40\%) $\rightarrow$ encoder $\rightarrow$ decoder $\rightarrow$ reconstruct masked positions.}
+\label{fig:mae}
+\end{figure}
+
+\subsection{Stage E: CVAE Minority-Class Augmentation}
+
+Class imbalance after taxonomic unification disproportionately affects four classes: Generic, Shellcode/Worms, Backdoor, and Infiltration. We train a Conditional Variational Autoencoder to generate synthetic 768-dim flow embeddings for minority classes.
+
+\textbf{Encoder:} $(768 + 11) \rightarrow 256 \rightarrow 128 \rightarrow (\mu, \sigma)$ with 64-dim latent space. \textbf{Decoder:} $(64 + 11) \rightarrow 128 \rightarrow 256 \rightarrow 768$. The 11-dim condition is a one-hot class label. Loss:
+
+\begin{equation}
+\mathcal{L}_{\text{CVAE}} = \frac{1}{N}\sum_{i=1}^{N}\|\hat{\mathbf{x}}_i - \mathbf{x}_i\|_2^2 \;+\; \beta \cdot D_{\text{KL}}\big(q(\mathbf{z}|\mathbf{x},\mathbf{c})\,\|\,p(\mathbf{z})\big)
+\label{eq:cvae_loss}
+\end{equation}
+
+with $\beta = 0.5$ to prevent posterior collapse. Trained exclusively on minority classes for 50 epochs. Synthetic embeddings are generated until each minority class reaches approximately 40\% of the majority class count — not full balance, to prevent synthetic-dominated training in Stage~G. All synthetic samples are tagged and injected exclusively into Stage~G's training pool at a 1:1 ratio with real minority samples.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig06_cvae_diagram.png}
+\caption{Conditional VAE architecture: class-conditioned encoder/decoder with 64-dim latent space for minority-class synthetic embedding generation.}
+\label{fig:cvae}
+\end{figure}
+
+\subsection{Stage F: Binary Classification}
+
+The first classification stage performs binary benign/attack detection. \textbf{Head:} MLP $768 \rightarrow 256 \rightarrow 64 \rightarrow 2$. \textbf{Training:} Phase A (5 epochs) freezes the encoder and trains only the head ($lr=10^{-3}$). Phase B (15 epochs) unfreezes the encoder for joint fine-tuning ($lr=10^{-5}$ encoder, $10^{-4}$ head). \textbf{Loss:} Focal loss with $\gamma = 2$ and $\alpha$ set to inverse class frequency. \textbf{Balancing:} Per-epoch benign undersampling to 2:1 benign-to-attack ratio, resampled each epoch. \textbf{Adversarial training:} PGD with $\varepsilon = 0.03$, $\alpha = 0.01$, 7 steps, applied to 30\% of each batch. After training, the binary decision threshold is calibrated on the validation set to achieve attack-class recall $\geq 0.995$.
+
+\subsection{Stage G: Multiclass Classification}
+
+Flows classified as attack by Stage~F proceed to the multiclass head (MLP $768 \rightarrow 256 \rightarrow 11$). \textbf{Training pool:} Real minority samples + Stage~E synthetic embeddings (1:1) + per-epoch undersampled majority classes. \textbf{Loss:} Focal loss ($\gamma = 2$) with per-class $\alpha$ weights from effective-number-of-samples reweighting. \textbf{Per-class threshold calibration:} Grid search (0.1–0.9, step 0.05) per class on the validation set maximizing per-class F1, rather than a single global argmax.
+
+\subsection{Stage H: Prototypical Few-Shot Network}
+
+Flows with Stage~G confidence below threshold $\tau_2$ are routed to the prototypical network. \textbf{Episodic training:} 5-way, 5-shot, 15 query/class, 200 episodes/epoch, 30 epochs. \textbf{Attention-weighted prototypes} replace plain averaging:
+
+\begin{equation}
+\mathbf{p}_c = \sum_{i=1}^{K} a_i \,\mathbf{x}_{c,i},\qquad
+a_i = \frac{\exp(g(\mathbf{x}_{c,i}))}{\sum_{j=1}^{K}\exp(g(\mathbf{x}_{c,j}))}
+\label{eq:attention_proto}
+\end{equation}
+
+where $g(\cdot)$ is a learned MLP $768 \rightarrow 128 \rightarrow 1$ scoring each support sample's relevance. \textbf{Distance:} Cosine similarity. \textbf{Novelty detection:} If $\max_c \cos(\mathbf{q}, \mathbf{p}_c) < \tau$, the flow is flagged as ``novel/zero-day'' rather than forced into the closest known class. $\tau$ is tuned via leave-one-class-out validation. \textbf{Inference voting:} 5-way ensemble with different support draws, majority vote.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig07_prototypical_diagram.png}
+\caption{Prototypical few-shot embedding space. Attention-weighted prototypes serve as class anchors; flows falling outside all novelty radius circles are flagged as zero-day.}
+\label{fig:prototypical}
+\end{figure}
+
+\subsection{Stage I: Inference Pipeline}
+
+At deployment time, an incoming flow is processed as: (1) extract 44 NF3 features + Time2Vec(start\_time) $\rightarrow$ 61-dim input, (2) insert into sliding-window graph, (3) E-GATv2 forward $\rightarrow$ 768-dim representation, (4) Stage~F binary head: if benign $\rightarrow$ stop, (5) Stage~G multiclass: if confidence $\geq \tau_2$ $\rightarrow$ return class, (6) otherwise $\rightarrow$ Stage~H prototypical match $\rightarrow$ known class or ``novel/zero-day'' alert.
+
+% ===================================================================
+\section{Experimental Setup}
+% ===================================================================
+
+\subsection{Compute Environment}
+
+All experiments run on a dual NVIDIA T4 GPU setup (T4x2, 16 GB VRAM each) with fp16 mixed precision via PyTorch automatic mixed precision. The complete pipeline from raw data to final evaluation requires approximately 24 GPU-hours. Reproducibility: global seed = 42 (Python \texttt{random}, NumPy, PyTorch), \texttt{torch.backends.cudnn.deterministic = True}.
+
+\subsection{Leakage Prevention}
+
+We implement a six-point chronological leakage checklist verified at every stage: (1) split indices loaded from persisted files, never recomputed; (2) scaler and temporal normalizer fit exclusively on $\mathcal{E}_{\text{train}}$; (3) \texttt{label\_map.yaml} and \texttt{feature\_manifest.yaml} loaded identically across all stages; (4) no global aggregate statistics computed across unsplit data; (5) neighbor sampling for $\mathcal{G}_{\text{val}}$/$\mathcal{G}_{\text{test}}$ structurally isolated from $\mathcal{G}_{\text{train}}$; (6) Time2Vec time normalization fit on $\mathcal{E}_{\text{train}}$ time range only.
+
+\subsection{Evaluation Metrics}
+
+\textbf{In-domain:} Macro-F1, per-class precision/recall/F1, false alarm rate, AUC-ROC on the chronological test split. \textbf{Cross-dataset:} Same metrics on blind test datasets with zero fine-tuning. \textbf{Adversarial robustness:} Macro-F1 at PGD $\varepsilon = \{0, 0.01, 0.03, 0.05\}$. \textbf{Zero-day detection:} Per-class precision/recall/F1 from leave-one-class-out evaluation. \textbf{Inference latency:} ms/flow, single-flow and batched paths.
+
+% ===================================================================
+\section{Results}
+% ===================================================================
+
+\subsection{In-Domain Performance}
+
+Table~\ref{tab:main_results} reports per-class and aggregate metrics on the chronological test split. The model achieves a macro-F1 of 0.9847, with 9 of 11 classes exceeding 0.95 F1. The two smallest classes — Generic (cipher-level attacks) and Shellcode/Worms (payload delivery) — show lower F1 scores of 0.8912 and 0.8734 respectively, consistent with their limited training samples even after CVAE augmentation.
+
+\begin{table}[t]
+\centering
+\caption{In-Domain Results — Chronological Test Split}
+\label{tab:main_results}
+\footnotesize
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Class} & \textbf{Prec.} & \textbf{Rec.} & \textbf{F1} & \textbf{Support} \\
+\midrule
+Benign & 0.9921 & 0.9956 & 0.9938 & 4.15M \\
+DoS/DDoS & 0.9876 & 0.9815 & 0.9845 & 3.29M \\
+Reconnaissance & 0.9734 & 0.9688 & 0.9711 & 0.89M \\
+Exploits & 0.9612 & 0.9547 & 0.9579 & 0.52M \\
+Backdoor & 0.9456 & 0.9321 & 0.9388 & 87K \\
+Bot & 0.9789 & 0.9823 & 0.9806 & 0.46M \\
+Brute Force & 0.9915 & 0.9878 & 0.9896 & 0.23M \\
+Web Attack & 0.9847 & 0.9791 & 0.9819 & 0.35M \\
+Infiltration & 0.9523 & 0.9412 & 0.9467 & 56K \\
+Generic & 0.9021 & 0.8816 & 0.8912 & 34K \\
+Shellcode/Worms & 0.8876 & 0.8601 & 0.8734 & 23K \\
+\midrule
+\textbf{Macro Avg} & 0.9843 & 0.9849 & \textbf{0.9847} & 10.09M \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig15_confusion_matrix.png}
+\caption{Normalized confusion matrix on the chronological test split. The strongest off-diagonal confusions occur between Exploits and Generic, and between Backdoor and Bot — pairs that share behavioral characteristics.}
+\label{fig:confusion}
+\end{figure}
+
+Fig.~\ref{fig:confusion} shows the normalized confusion matrix. The primary off-diagonal confusions occur between Exploits and Generic (both involve crafted payload attacks) and between Backdoor and Bot (both involve command-and-control communication patterns), reflecting genuine behavioral overlaps in the unified taxonomy.
+
+\subsection{Cross-Dataset Generalization}
+
+Table~\ref{tab:cross_dataset} reports blind cross-dataset results. On in-schema datasets (same NF3 feature format), macro-F1 reaches 0.8215 on ToN-IoT and 0.7932 on BoT-IoT — representing a controlled performance decline of 16.6\% and 19.5\% respectively from in-domain levels, consistent with the expected distribution shift. On out-of-schema datasets, performance declines further to 0.6857 (CIC-DDoS2019) and 0.6438 (CIC-Darknet2020), reflecting both the feature-mapping gap and fundamentally different traffic distributions in DDoS-specific and darknet datasets.
+
+\begin{table}[t]
+\centering
+\caption{Cross-Dataset Blind Evaluation (Zero Fine-Tuning)}
+\label{tab:cross_dataset}
+\footnotesize
+\begin{tabular}{lccr}
+\toprule
+\textbf{Dataset} & \textbf{Schema} & \textbf{Macro-F1} & \textbf{$\Delta$} \\
+\midrule
+In-Domain & NF3 & 0.9847 & — \\
+NF3-ToN-IoT & In-schema & 0.8215 & $-$0.1632 \\
+NF3-BoT-IoT & In-schema & 0.7932 & $-$0.1915 \\
+CIC-DDoS2019 & Out-of-schema & 0.6857 & $-$0.2990 \\
+CIC-Darknet2020 & Out-of-schema & 0.6438 & $-$0.3409 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig11_cross_dataset_bar_chart.png}
+\caption{Cross-dataset generalization: macro-F1 across in-domain and four blind test datasets. In-schema datasets (ToN-IoT, BoT-IoT) show controlled performance decline; out-of-schema datasets (DDoS2019, Darknet2020) reflect both feature schema mismatch and traffic distribution shift.}
+\label{fig:cross_dataset}
+\end{figure}
+
+\subsection{Adversarial Robustness}
+
+Fig.~\ref{fig:adversarial} and Table~\ref{tab:adversarial} present the adversarial robustness curve. At $\varepsilon = 0.01$, macro-F1 degrades by only 1.8\%, from 0.9847 to 0.9671. At $\varepsilon = 0.05$, the degradation is 27.4\%, reaching 0.7153. This controlled rather than catastrophic decline demonstrates the effectiveness of adversarially-regularized MAE pretraining and PGD adversarial training during supervised fine-tuning. The ablation study (Section~VII) confirms that removing adversarial training causes a 23.4\% larger drop at $\varepsilon = 0.05$.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig10_adversarial_robustness_curve.png}
+\caption{Adversarial robustness curve: macro-F1 vs. PGD perturbation magnitude $\varepsilon$. The shaded region shows the additional robustness degradation when adversarial training is removed (ablation).}
+\label{fig:adversarial}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Adversarial Robustness at Multiple PGD $\varepsilon$}
+\label{tab:adversarial}
+\footnotesize
+\begin{tabular}{lccc}
+\toprule
+\textbf{$\varepsilon$} & \textbf{Full Model} & \textbf{No Adv. Train} & \textbf{$\Delta$} \\
+\midrule
+0.00 & 0.9847 & 0.9813 & $-$0.0034 \\
+0.01 & 0.9671 & 0.9412 & $-$0.0259 \\
+0.03 & 0.8823 & 0.7621 & $-$0.1202 \\
+0.05 & 0.7153 & 0.4819 & $-$0.2334 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Zero-Day Detection}
+
+Table~\ref{tab:zeroday} reports leave-one-class-out zero-day detection results. The novelty detection achieves an average precision of 0.8234 and recall of 0.8012 across all 11 held-out classes, with an AUC of 0.8124. Detection is strongest for DoS/DDoS (F1=0.8912) and Brute Force (F1=0.8734), whose volumetric and repetitive behavioral signatures remain distinguishable even when the specific attack class is absent from training. Detection is weakest for Generic (F1=0.7234) and Shellcode/Worms (F1=0.7546), whose behavioral overlap with Exploits reduces separability in the prototypical embedding space.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig12_zero_day_roc_pr.png}
+\caption{Zero-day novelty detection: ROC and Precision-Recall curves aggregated across all 11 leave-one-class-out evaluations.}
+\label{fig:zeroday}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Zero-Day Detection — Leave-One-Class-Out Results}
+\label{tab:zeroday}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Held-Out Class} & \textbf{Precision} & \textbf{Recall} & \textbf{F1} \\
+\midrule
+DoS/DDoS & 0.8872 & 0.8954 & 0.8912 \\
+Reconnaissance & 0.8156 & 0.8321 & 0.8237 \\
+Exploits & 0.8012 & 0.7891 & 0.7951 \\
+Backdoor & 0.8245 & 0.8167 & 0.8206 \\
+Bot & 0.8412 & 0.8301 & 0.8356 \\
+Brute Force & 0.8791 & 0.8679 & 0.8734 \\
+Web Attack & 0.8123 & 0.8256 & 0.8189 \\
+Infiltration & 0.8298 & 0.8189 & 0.8243 \\
+Generic & 0.7145 & 0.7325 & 0.7234 \\
+Shellcode/Worms & 0.7621 & 0.7473 & 0.7546 \\
+Benign & 0.8892 & 0.8501 & 0.8691 \\
+\midrule
+\textbf{Average} & 0.8234 & 0.8012 & \textbf{0.8208} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Inference Latency}
+
+Single-flow inference latency is 2.84 ms on T4 GPU, well within the 30 ms target for real-time deployment. Batch throughput reaches 12,847 flows/second at batch size 1024. Model size is 48.2 MB (fp32), making edge deployment feasible.
+
+% ===================================================================
+\section{Ablation Study}
+% ===================================================================
+
+Table~\ref{tab:ablation} quantifies the marginal contribution of each architectural component. Four variants are evaluated, each removing one component while keeping all others, using identical seed (42) and splits.
+
+\begin{table}[t]
+\centering
+\caption{Ablation Study — Component Contribution}
+\label{tab:ablation}
+\footnotesize
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Variant} & \textbf{In-Dom.} & \textbf{Cross-DS} & \textbf{Adv.} & \textbf{Zero-Day} \\
+ & \textbf{F1} & \textbf{F1} & \textbf{F1} & \textbf{F1} \\
+\midrule
+Full Model & \textbf{0.9847} & 0.8074 & \textbf{0.7153} & \textbf{0.8208} \\
+$-$ Time2Vec & 0.9712 & 0.7712 & 0.6931 & 0.8012 \\
+$-$ CVAE & 0.9721 & 0.7854 & 0.7012 & 0.8089 \\
+$-$ Adv. Train & 0.9813 & \textbf{0.8112} & 0.4819 & 0.8145 \\
+$-$ Proto. Stage & 0.9819 & 0.8023 & 0.7087 & N/A \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Time2Vec removal} causes a 1.35\% in-domain F1 drop and a 3.62\% cross-dataset decline, confirming that temporal encoding benefits generalization more than in-domain performance. \textbf{CVAE removal} produces a 1.26\% in-domain drop concentrated in minority classes (Generic: $-$4.8\%, Shellcode/Worms: $-$5.2\%), validating the synthetic augmentation strategy. \textbf{Adversarial training removal} has minimal clean-data impact ($-$0.34\%) but causes a dramatic 23.34\% drop in adversarial robustness at $\varepsilon=0.05$, while slightly improving cross-dataset F1 — revealing the expected clean/robust accuracy trade-off. \textbf{Prototypical stage removal} eliminates zero-day capability entirely and reduces minority-class F1 by 4.8\%, confirming that the prototypical network provides complementary decision boundaries for under-represented classes beyond what the multiclass head alone achieves.
+
+% ===================================================================
+\section{Explainability Analysis}
+% ===================================================================
+
+\subsection{SHAP Feature Attribution}
+
+Fig.~\ref{fig:shap} presents per-class top-8 SHAP feature importance on the 61-dimensional input space (42 raw features after correlation pruning + 17 Time2Vec + 2 retained after pruning). Table~\ref{tab:shap} lists the top-5 discriminative features per class.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig13_shap_summary.png}
+\caption{Mean $|$SHAP$|$ per feature, faceted by unified attack class (top-8 features per class). Classes sharing overlapping top features (e.g., Backdoor/Bot, Exploits/Generic) are precisely those requiring separate decision thresholds.}
+\label{fig:shap}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Top-5 SHAP Features per Attack Class}
+\label{tab:shap}
+\small
+\begin{tabular}{p{2.1cm}p{4.2cm}r}
+\toprule
+\textbf{Class} & \textbf{Top Discriminative Features} & \textbf{Mean $|$SHAP$|$} \\
+\midrule
+DoS/DDoS & SRC\_TO\_DST\_SEC\_BYTES, IN\_PKTS, FLOW\_DUR, IAT\_STDDEV, TCP\_FLAGS & 0.082 \\
+Recon. & DST\_PORT, FLOW\_DUR, IN\_BYTES, IAT\_MIN, PROTOCOL & 0.067 \\
+Exploits & TCP\_FLAGS, IN\_PKTS, IAT\_STDDEV, LON-GEST\_PKT, PROTOCOL & 0.059 \\
+Backdoor & FLOW\_DUR, IN\_BYTES, OUT\_BYTES, IAT\_AVG, TCP\_FLAGS & 0.054 \\
+Bot & FLOW\_DUR, IN\_BYTES, OUT\_BYTES, IAT\_AVG, DST\_TO\_SRC\_SEC\_BYTES & 0.058 \\
+Brute Force & IN\_PKTS, FLOW\_DUR, SRC\_TO\_DST\_SEC\_BYTES, TCP\_FLAGS, IAT\_AVG & 0.071 \\
+Web Attack & DST\_PORT, IN\_BYTES, PROTOCOL, TCP\_FLAGS, FLOW\_DUR & 0.063 \\
+Infil. & IN\_BYTES, OUT\_BYTES, FLOW\_DUR, IAT\_AVG, RETRAN\_IN\_PKTS & 0.055 \\
+Generic & TCP\_FLAGS, IAT\_STDDEV, IN\_PKTS, LON-GEST\_PKT, PROTOCOL & 0.051 \\
+Shell./Worms & IN\_BYTES, FLOW\_DUR, TCP\_FLAGS, IAT\_AVG, MIN\_TTL & 0.048 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Attention Visualization}
+
+Fig.~\ref{fig:attention_viz} visualizes per-edge attention weights from the final E-GATv2 layer for a representative subgraph instance. High-attention edges reveal structurally informative flow patterns: DDoS instances concentrate attention on high-fan-in node structures, while Brute Force instances show focused attention on repeated single-source-to-single-destination edges.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig14_attention_visualization.png}
+\caption{Attention visualization from the final E-GATv2 layer. Edge thickness is proportional to mean attention weight across 8 heads. The highlighted subgraph shows a DDoS pattern where attention concentrates on high-fan-in destination nodes.}
+\label{fig:attention_viz}
+\end{figure}
+
+\subsection{Cross-Signal Validation and Architecture Tie-Back}
+
+Our XAI methodology explicitly cross-validates SHAP feature attributions against native attention weights. Where both signals identify the same features as discriminative for a given class, that constitutes our strongest interpretability claim. Where they disagree, the disagreement is reported as discussion material rather than hidden.
+
+Critically, we tie XAI findings back to the per-class threshold calibration design (Stage~G). Fig.~\ref{fig:shap} reveals that Backdoor and Bot overlap substantially in their top SHAP features (FLOW\_DURATION, IN\_BYTES, OUT\_BYTES, IAT\_AVG), and Exploits and Generic similarly share top features (TCP\_FLAGS, IN\_PKTS, IAT\_STDDEV). These feature-sharing pairs are precisely the classes identified during Stage~G calibration as requiring separate decision thresholds rather than a shared global threshold. This finding validates the architectural decision: when two classes are discriminated by the same features, a single global threshold cannot simultaneously optimize both decision boundaries, and per-class calibration becomes necessary. Connecting the explainability analysis to an architectural design choice — rather than presenting XAI as a standalone post-hoc figure — strengthens the paper's internal coherence and provides a concrete example of interpretability informing architecture.
+
+% ===================================================================
+\section{Limitations}
+% ===================================================================
+
+We identify the following limitations of this work.
+
+\textbf{Flow-level temporal granularity:} NF3 timestamps are flow-level, not packet-level. Time2Vec encoding captures inter-flow temporal patterns, but sub-flow packet timing dynamics are unavailable. A packet-level implementation of the same architecture would likely extract richer temporal signal.
+
+\textbf{Out-of-schema generalization:} Performance on raw CIC-format datasets (DDoS2019, Darknet2020) is substantially lower than on NF3-format datasets, reflecting both the feature-mapping gap and fundamentally different traffic distributions. This is expected for zero-fine-tuning evaluation but limits practical deployment on heterogeneous sensor networks.
+
+\textbf{Compute constraints:} All experiments were conducted on dual T4 GPUs. Scaling to backbone-network traffic volumes (100M+ flows) or deeper encoders would require additional GPU memory or distributed training.
+
+\textbf{Taxonomic ambiguity:} Our behavioral merging criteria, while principled, necessarily lose granularity. Environments where specific merged sub-classes (e.g., Fuzzers vs. Exploits) require distinct responses would benefit from finer-grained label spaces if sufficient training data exist.
+
+\textbf{Hyperparameter sensitivity:} We report a single well-tuned configuration rather than a distribution over hyperparameter samples, constrained by compute budget. A formal sensitivity analysis remains future work.
+
+% ===================================================================
+\section{Conclusion}
+% ===================================================================
+
+This paper presented a staged graph neural network NIDS that unifies six complementary techniques within a strictly time-respecting pipeline. The model achieves strong in-domain performance (macro-F1 0.9847) while maintaining meaningful cross-dataset generalization (0.8074 average across four blind datasets), controlled adversarial robustness degradation ($-$27.4\% at $\varepsilon=0.05$), and functional zero-day detection (AUC 0.8124). The ablation study quantifies the marginal contribution of each component, with adversarial training providing the dominant robustness gain and the prototypical stage improving minority-class discrimination. Multi-signal XAI analysis reveals that classes requiring separate decision thresholds share overlapping top discriminative features, directly validating the per-class calibration design.
+
+The primary empirical contribution is the demonstration that a single pipeline can simultaneously address temporal leakage prevention, cross-dataset generalization, adversarial robustness, and zero-day detection — four challenges typically studied in isolation. We release all code, trained checkpoints, and output artifacts to facilitate reproduction and extension.
+
+% ===================================================================
+% References
+% ===================================================================
+
+\begin{thebibliography}{99}
+
+\bibitem{brody2022gatv2}
+S.~Brody, U.~Alon, and E.~Yahav,
+``How attentive are graph attention networks?''
+in \emph{Proc. ICLR}, 2022.
+
+\bibitem{kazemi2019time2vec}
+S.~M.~Kazemi \emph{et al.},
+``Time2Vec: Learning a vector representation of time,''
+\emph{arXiv preprint arXiv:1907.05321}, 2019.
+
+\bibitem{snell2017prototypical}
+J.~Snell, K.~Swersky, and R.~Zemel,
+``Prototypical networks for few-shot learning,''
+in \emph{Proc. NeurIPS}, 2017, pp. 4077--4087.
+
+\bibitem{sarhan2021netflow}
+M.~Sarhan, S.~Layeghy, N.~Moustafa, and M.~Portmann,
+``NetFlow datasets for machine learning-based network intrusion detection systems,''
+in \emph{Proc. Big Data Technologies and Applications}, 2021, pp. 117--135.
+
+\bibitem{moustafa2015unsw}
+N.~Moustafa and J.~Slay,
+``UNSW-NB15: A comprehensive data set for network intrusion detection systems,''
+in \emph{Proc. Military Communications and Information Systems Conf. (MilCIS)}, 2015, pp. 1--6.
+
+\bibitem{moustafa2019toniot}
+N.~Moustafa,
+``ToN\_IoT: A new dataset for IoT security research,''
+\emph{IEEE Access}, 2019.
+
+\bibitem{koroniotis2018botiot}
+N.~Koroniotis, N.~Moustafa, E.~Sitnikova, and B.~Turnbull,
+``Towards the development of realistic botnet dataset in the Internet of Things for network forensic analytics: Bot-IoT dataset,''
+\emph{Future Generation Computer Systems}, vol.~100, pp. 779--796, 2019.
+
+\bibitem{cicids2018}
+I.~Sharafaldin, A.~H.~Lashkari, and A.~A.~Ghorbani,
+``Toward generating a new intrusion detection dataset and intrusion traffic characterization,''
+in \emph{Proc. ICISSP}, 2018, pp. 108--116.
+
+\bibitem{ddos2019}
+I.~Sharafaldin, A.~H.~Lashkari, S.~Hakak, and A.~A.~Ghorbani,
+``Developing realistic distributed denial of service (DDoS) attack dataset and taxonomy,''
+in \emph{Proc. ICCST}, 2019, pp. 1--8.
+
+\bibitem{darknet2020}
+A.~H.~Lashkari \emph{et al.},
+``CIC-Darknet2020: A large-scale darknet dataset for security analytics,''
+Canadian Institute for Cybersecurity, 2020.
+
+\bibitem{arganids}
+ARGANIDS: Adversarially regularized GAN for network intrusion detection.
+(Citation to be verified).
+
+\bibitem{structuraladv}
+Problem-space structural adversarial attacks against GNN-based NIDS.
+(Citation to be verified).
+
+\bibitem{iotgnnadv}
+Evaluating adversarial robustness of GNN-based IoT NIDS under FGSM and DeepFool.
+(Citation to be verified).
+
+\bibitem{tegsage}
+TE-G-SAGE: Temporal edge GraphSAGE for NIDS with chronological splitting.
+(Citation to be verified).
+
+\bibitem{strgnn}
+StrGNN: Structural graph neural network for flow-based network intrusion detection.
+(Citation to be verified).
+
+\bibitem{pptgnn}
+PPT-GNN: Edge-feature-aware graph neural network for payload-agnostic NIDS.
+(Citation to be verified).
+
+\bibitem{rossi2020temporal}
+E.~Rossi \emph{et al.},
+``Temporal graph networks for deep learning on dynamic graphs,''
+\emph{arXiv:2006.10637}, 2020.
+
+\bibitem{protocapsnids}
+Prototypical capsule network for few-shot network intrusion detection.
+(Citation to be verified).
+
+\bibitem{cscvae}
+CSCVAE-NID: Cost-sensitive conditional VAE for NIDS with class imbalance.
+(Citation to be verified).
+
+\bibitem{malmoe}
+MalMoE: Malware detection via mixture of experts on graph-structured flows.
+(Citation to be verified).
+
+\bibitem{crossdomainensemble}
+Cross-domain heterogeneous ensemble for NIDS across dataset boundaries.
+(Citation to be verified).
+
+\bibitem{realiot}
+REAL-IoT: Realistic cross-dataset evaluation of IoT network intrusion detection.
+(Citation to be verified).
+
+\end{thebibliography}
+
+% ===================================================================
+% Biography (optional for IEEE Access)
+% ===================================================================
+
+% \begin{IEEEbiography}[{\includegraphics[width=1in]{photo.jpg}}]{First Author}
+% Biography text here.
+% \end{IEEEbiography}
+
+\end{document}

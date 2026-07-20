@@ -1,0 +1,89 @@
+# Unified 11-class attack taxonomy mapping
+# Applied at Stage A after loading raw NF3 CSVs, before any split/graph construction.
+# Loaded identically by all notebooks — do not redefine per-notebook.
+
+# Mapping per source dataset
+NF-UNSW-NB15:
+  Benign: Benign
+  Fuzzers: Exploits
+  Analysis: Reconnaissance
+  Backdoor: Backdoor
+  DoS: DoS/DDoS
+  Exploits: Exploits
+  Generic: Generic
+  Reconnaissance: Reconnaissance
+  Shellcode: Shellcode/Worms
+  Worms: Shellcode/Worms
+
+NF-CSE-CIC-IDS2018:
+  Benign: Benign
+  Bot: Bot
+  # DoS/DDoS variants
+  DoS: DoS/DDoS
+  DDoS: DoS/DDoS
+  DoS_attacks-GoldenEye: DoS/DDoS
+  DoS_attacks-Slowloris: DoS/DDoS
+  DoS_attacks-SlowHTTPTest: DoS/DDoS
+  DoS_attacks-Hulk: DoS/DDoS
+  DDoS_attacks-LOIC-HTTP: DoS/DDoS
+  DDOS_attack-LOIC-UDP: DoS/DDoS
+  DDOS_attack-HOIC: DoS/DDoS
+  # Brute Force variants
+  "Brute Force": Brute Force
+  FTP-BruteForce: Brute Force
+  BruteForce: Brute Force
+  SSH-Bruteforce: Brute Force
+  # Web Attack variants
+  "Web Attack": Web Attack
+  WebAttack: Web Attack
+  Brute_Force_-Web: Web Attack
+  Brute_Force_-XSS: Web Attack
+  SQL_Injection: Web Attack
+  # Infiltration
+  Infiltration: Infiltration
+  Infilteration: Infiltration
+
+NF-ToN-IoT:
+  Benign: Benign
+  backdoor: Backdoor
+  Backdoor: Backdoor
+  ddos: DoS/DDoS
+  dos: DoS/DDoS
+  injection: Web Attack
+  mitm: Exploits
+  password: Brute Force
+  ransomware: Generic
+  scanning: Reconnaissance
+  xss: Web Attack
+
+NF-BoT-IoT:
+  Benign: Benign
+  DDoS: DoS/DDoS
+  DoS: DoS/DDoS
+  Reconnaissance: Reconnaissance
+  Theft: Infiltration
+
+# Unified taxonomy (11 classes)
+unified_classes:
+  - Benign
+  - DoS/DDoS
+  - Reconnaissance
+  - Exploits
+  - Backdoor
+  - Bot
+  - Brute Force
+  - Web Attack
+  - Infiltration
+  - Generic
+  - Shellcode/Worms
+
+# Classes identified as smallest post-merge (primary CVAE augmentation targets)
+minority_classes:
+  - Generic
+  - Shellcode/Worms
+  - Backdoor
+  - Infiltration
+
+# NOTE: If actual CSV Attack column values differ from the keys above,
+# the schema check in Notebook 1 will flag mismatches.
+# This file is the canonical mapping — update it if labels drift.
