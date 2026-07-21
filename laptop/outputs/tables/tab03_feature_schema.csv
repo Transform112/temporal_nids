@@ -1,0 +1,53 @@
+Category,Feature,Status,Dimension
+Volume,IN_BYTES,kept,raw
+Volume,IN_PKTS,kept,raw
+Volume,OUT_BYTES,kept,raw
+Volume,OUT_PKTS,kept,raw
+Protocol/Flags,PROTOCOL,kept,raw
+Protocol/Flags,TCP_FLAGS,kept,raw
+Protocol/Flags,CLIENT_TCP_FLAGS,kept,raw
+Protocol/Flags,SERVER_TCP_FLAGS,kept,raw
+Duration,FLOW_DURATION_MILLISECONDS,kept,raw
+Duration,DURATION_IN,kept,raw
+Duration,DURATION_OUT,kept,raw
+TTL,MIN_TTL,kept,raw
+TTL,MAX_TTL,kept,raw
+Packet Size,LONGEST_FLOW_PKT,kept,raw
+Packet Size,SHORTEST_FLOW_PKT,kept,raw
+Packet Size,MIN_IP_PKT_LEN,kept,raw
+Throughput,SRC_TO_DST_SECOND_BYTES,kept,raw
+Throughput,DST_TO_SRC_SECOND_BYTES,kept,raw
+Retransmission,RETRANSMITTED_IN_BYTES,kept,raw
+Retransmission,RETRANSMITTED_IN_PKTS,kept,raw
+Retransmission,RETRANSMITTED_OUT_BYTES,kept,raw
+Retransmission,RETRANSMITTED_OUT_PKTS,kept,raw
+Avg Throughput,SRC_TO_DST_AVG_THROUGHPUT,kept,raw
+Packet Histogram,NUM_PKTS_UP_TO_128_BYTES,kept,raw
+Packet Histogram,NUM_PKTS_128_TO_256_BYTES,kept,raw
+Packet Histogram,NUM_PKTS_256_TO_512_BYTES,kept,raw
+Packet Histogram,NUM_PKTS_512_TO_1024_BYTES,kept,raw
+Packet Histogram,NUM_PKTS_1024_TO_1514_BYTES,kept,raw
+TCP Window,TCP_WIN_MAX_IN,kept,raw
+TCP Window,TCP_WIN_MAX_OUT,kept,raw
+ICMP,ICMP_TYPE,kept,raw
+ICMP,ICMP_IPV4_TYPE,kept,raw
+DNS,DNS_QUERY_TYPE,kept,raw
+DNS,DNS_TTL_ANSWER,kept,raw
+Inter-Arrival Time (NF3-exclusive),SRC_TO_DST_IAT_MIN,kept,raw
+Inter-Arrival Time (NF3-exclusive),SRC_TO_DST_IAT_MAX,kept,raw
+Inter-Arrival Time (NF3-exclusive),SRC_TO_DST_IAT_AVG,kept,raw
+Inter-Arrival Time (NF3-exclusive),DST_TO_SRC_IAT_MIN,kept,raw
+Inter-Arrival Time (NF3-exclusive),DST_TO_SRC_IAT_MAX,kept,raw
+Inter-Arrival Time (NF3-exclusive),DST_TO_SRC_IAT_AVG,kept,raw
+Inter-Arrival Time (NF3-exclusive),DST_TO_SRC_IAT_STDDEV,kept,raw
+Dropped,IPV4_SRC_ADDR,dropped,—
+Dropped,IPV4_DST_ADDR,dropped,—
+Dropped,L4_SRC_PORT,dropped,—
+Dropped,L4_DST_PORT,dropped,—
+Dropped,L7_PROTO,dropped,—
+Dropped,FTP_COMMAND_RET_CODE,dropped,—
+Dropped,DNS_QUERY_ID,dropped,—
+Dropped,FLOW_START_MILLISECONDS,dropped,—
+Dropped,FLOW_END_MILLISECONDS,dropped,—
+Temporal (Time2Vec),Linear term (omega_0*t + b_0),kept,temporal
+Temporal (Time2Vec),Periodic terms x16 (sin(omega_k*t + b_k)),kept,temporal
