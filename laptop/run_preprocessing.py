@@ -1,4 +1,4 @@
-﻿"""
+"""
 PREPROCESSING PIPELINE — Prepare data for Kaggle upload.
 ==========================================================
 1. Clean NaN/Inf, apply labels → cleaned_{ds}.parquet
@@ -249,6 +249,7 @@ for ds_name, cfg in DATASETS.items():
                 dst_keys = [f"{ip}:{port}" for ip, port in
                            zip(w_data['IPV4_DST_ADDR'].values, w_data['L4_DST_PORT'].values)]
 
+                node_cache = {}  # PREP-1 fix: Reset per window
                 for key in src_keys + dst_keys:
                     if key not in node_cache:
                         node_cache[key] = len(node_cache)
@@ -258,7 +259,7 @@ for ds_name, cfg in DATASETS.items():
 
                 feat_cols = [f for f in KEPT if f in w_data.columns]
                 ea = torch.tensor(w_data[feat_cols].values.astype(np.float32))
-                et = torch.tensor(w_data[TIME_FIELD].values.astype(np.float32))
+                et = torch.tensor(w_data[TIME_FIELD].values.astype(np.float64))
                 y = torch.tensor([LABEL_TO_IDX.get(l, 0) for l in w_data['unified_label'].values],
                                  dtype=torch.long)
 
@@ -293,6 +294,7 @@ for ds_name, cfg in DATASETS.items():
         print(f"  {ds_name}: {sum(g.edge_index.shape[1] for g in graphs):,} train edges")
 
 all_train_ea = np.concatenate(all_train_ea, axis=0)
+assert all_train_ea.shape[0] > 10_000_000, "Scaler should be fit on both datasets"
 print(f"  Total E_train samples for scaler: {all_train_ea.shape[0]:,} x {all_train_ea.shape[1]}")
 
 scaler = StandardScaler()
@@ -311,7 +313,7 @@ for ds_name, cfg in DATASETS.items():
         if gpath.exists():
             graphs = torch.load(gpath, weights_only=False)
             for g in graphs:
-                g.edge_attr = torch.tensor(scaler.transform(g.edge_attr.numpy()), dtype=torch.float32)
+                g.edge_attr = torch.clamp(torch.tensor(scaler.transform(g.edge_attr.numpy()), dtype=torch.float32), -10.0, 10.0)
             torch.save(graphs, gpath)
             print(f"    {ds_name}_{sp}: normalized")
 
@@ -361,8 +363,7 @@ for f in sorted(PROCESSED.rglob('*')):
         print(f"    {f.relative_to(PROCESSED)} ({mb:.1f} MB)")
 print(f"\n  TOTAL: {total_mb:.0f} MB")
 print(f"\n  Upload these files as a Kaggle dataset named 'ids-nf3-processed'")
-print(f"  Then run k01 → k02 → k03 → k04 → k05 → k06 on Kaggle T4x2.")
+print(f"  Then run k01 -> k02 -> k03 -> k04 -> k05 -> k06 on Kaggle T4x2.")
 print("\n" + "="*60)
 print("PREPROCESSING COMPLETE")
 print("="*60)
-

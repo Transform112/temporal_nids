@@ -24,7 +24,7 @@ import torch_geometric; from torch_geometric.nn import GATv2Conv; from torch_geo
 SEED=42;random.seed(SEED);np.random.seed(SEED);torch.manual_seed(SEED)
 if torch.cuda.is_available():torch.cuda.manual_seed_all(SEED)
 
-WORKING=Path('/kaggle/working');INPUT=Path('/kaggle/input/datasets/mysteriousavailable/ids-nf3-processed/ids-nf3-processed')
+WORKING=Path('../working');INPUT = Path('/kaggle/input/datasets/mysteriousavailable/ids-nf3-processed/ids-nf3-processed')
 FIGS_DIR=WORKING/'outputs'/'figures';TABS_DIR=WORKING/'outputs'/'tables';LOGS_DIR=WORKING/'logs'
 for d in [FIGS_DIR,TABS_DIR,LOGS_DIR]:d.mkdir(parents=True,exist_ok=True)
 device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -44,31 +44,46 @@ class Time2Vec(nn.Module):
         return torch.cat([self.w0*t+self.b0,torch.sin(self.omega*t+self.bias)],dim=-1)
 
 class EGATv2Encoder(nn.Module):
-    def __init__(self,edge_dim=58,node_init=128,hidden=256,heads=8,layers=3,d_attn=0.3,d_feat=0.2):
+    def __init__(self, max_nodes, edge_dim=58, node_init=128, hidden=256, heads=8, layers=3,
+                 d_attn=0.3, d_feat=0.2, return_attention=False):
         super().__init__()
-        self.hidden=hidden;self.heads=heads;self.layers=layers;self.output_dim=hidden*3
-        self.node_init=node_init;self.node_embed=None;self.edge_proj=nn.Linear(edge_dim,hidden)
-        self.convs=nn.ModuleList();self.norms=nn.ModuleList();self.dropout=nn.Dropout(d_feat)
+        assert max_nodes is not None and max_nodes > 0, "max_nodes must be a positive int"
+        self.hidden=hidden; self.heads=heads; self.layers=layers
+        self.output_dim = hidden*3  # 768
+        self.node_init = node_init
+        self.max_nodes = max_nodes
+        self.return_attention = return_attention
+
+        self.node_embed = nn.Parameter(torch.randn(max_nodes, node_init) * 0.1)
+        self.edge_proj = nn.Linear(edge_dim, hidden)
+        self.convs = nn.ModuleList(); self.norms = nn.ModuleList()
+        self.dropout = nn.Dropout(d_feat)
         for _ in range(layers):
-            self.convs.append(GATv2Conv((-1,-1),hidden//heads,heads=heads,edge_dim=hidden,dropout=d_attn,concat=True))
+            self.convs.append(GATv2Conv((-1,-1), hidden//heads, heads=heads,
+                edge_dim=hidden, dropout=d_attn, concat=True))
             self.norms.append(nn.LayerNorm(hidden))
-        self.activation=nn.ELU()
-    def _get_node_embed(self,n,dev):
-        if self.node_embed is None or self.node_embed.shape[0]<n:
-            new=nn.Parameter(torch.randn(n,self.node_init,device=dev)*0.1)
-            if self.node_embed is not None:new.data[:self.node_embed.shape[0]]=self.node_embed.data
-            self.node_embed=new
-        return self.node_embed[:n]
-    def forward(self,data,return_attn=False):
-        x=self._get_node_embed(data.num_nodes,data.edge_index.device);ea=self.edge_proj(data.edge_attr)
-        all_attn=[]
-        for conv,norm in zip(self.convs,self.norms):
-            x_new,attn=conv(x,data.edge_index,edge_attr=ea,return_attention_weights=True)
-            if return_attn:all_attn.append(attn)
-            x_new=self.activation(x_new);x_new=self.dropout(x_new);x_new=norm(x_new)
-            x=x+x_new if x.shape==x_new.shape else x_new
-        out=torch.cat([x[data.edge_index[0]],x[data.edge_index[1]],ea],dim=-1)
-        return (out,all_attn) if return_attn else out
+        self.activation = nn.ELU()
+
+    def forward(self, data, return_attn=False):
+        n = data.num_nodes
+        table_size = self.node_embed.shape[0]
+        if n <= table_size:
+            x = self.node_embed[:n]
+        else:
+            idx = torch.arange(n, device=self.node_embed.device) % table_size
+            x = self.node_embed[idx]
+        ea = self.edge_proj(data.edge_attr)
+        all_attn = []
+        for conv, norm in zip(self.convs, self.norms):
+            if return_attn or self.return_attention:
+                x_new, attn = conv(x, data.edge_index, edge_attr=ea, return_attention_weights=True)
+                all_attn.append(attn)
+            else:
+                x_new = conv(x, data.edge_index, edge_attr=ea)
+            x_new = self.activation(x_new); x_new = self.dropout(x_new)
+            x = norm(x + x_new) if x.shape == x_new.shape else norm(x_new)
+        out = torch.cat([x[data.edge_index[0]], x[data.edge_index[1]], ea], dim=-1)
+        return (out, all_attn) if (return_attn or self.return_attention) else out
 
 class BinaryHead(nn.Module):
     def __init__(self):super().__init__();self.net=nn.Sequential(nn.Linear(768,256),nn.ELU(),nn.Dropout(0.3),nn.Linear(256,64),nn.ELU(),nn.Dropout(0.2),nn.Linear(64,2))
@@ -82,7 +97,9 @@ class MulticlassHead(nn.Module):
 ckpt_f=torch.load(WORKING/'checkpoints'/'F_binary'/'best.pt',map_location=device,weights_only=False)
 ckpt_g=torch.load(WORKING/'checkpoints'/'G_multiclass'/'best.pt',map_location=device,weights_only=False)
 
-t2v=Time2Vec(k=16).to(device);encoder=EGATv2Encoder(edge_dim=EDGE_DIM).to(device)
+t2v=Time2Vec(k=16).to(device)
+enc_max_nodes = ckpt_g['encoder']['node_embed'].shape[0]
+encoder=EGATv2Encoder(max_nodes=enc_max_nodes, edge_dim=EDGE_DIM).to(device)
 bin_head=BinaryHead().to(device);multi_head=MulticlassHead(nc=N_CLASSES).to(device)
 t2v.load_state_dict(ckpt_g['t2v']);encoder.load_state_dict(ckpt_g['encoder'],strict=False)
 bin_head.load_state_dict(ckpt_f['head']);multi_head.load_state_dict(ckpt_g['head'])
@@ -175,6 +192,7 @@ gc.collect(); torch.cuda.empty_cache()
 print("\n"+"="*50+"\nADVERSARIAL ROBUSTNESS\n"+"="*50)
 G_test_sub=[];n_per=2000
 for g in G_test[:5]:
+    g = g.clone()
     if g.edge_index.shape[1]>n_per:
         idx=torch.randperm(g.edge_index.shape[1])[:n_per];g.edge_index=g.edge_index[:,idx];g.edge_attr=g.edge_attr[idx];g.edge_time=g.edge_time[idx];g.y=g.y[idx]
     G_test_sub.append(g)
@@ -217,7 +235,7 @@ print("\n"+"="*50+"\nt-SNE VISUALIZATION\n"+"="*50)
 sample_embs,sample_lbls=[],[]
 with torch.no_grad():
     for g in G_test[:3]:
-        g=g.to(device)
+        g=g.clone().to(device)
         if g.edge_index.shape[1]>1000:
             idx=torch.randperm(g.edge_index.shape[1])[:1000];g.edge_index=g.edge_index[:,idx];g.edge_attr=g.edge_attr[idx];g.edge_time=g.edge_time[idx];g.y=g.y[idx]
         reps=encoder(encode(g.edge_attr,g.edge_time,g.edge_index,g.num_nodes))
@@ -239,7 +257,7 @@ plt.tight_layout();plt.savefig(FIGS_DIR/'fig09_tsne_embeddings.png',dpi=300);plt
 
 # %% [cell 8] Inference Latency (Tab 10)
 print("\n"+"="*50+"\nLATENCY BENCHMARK\n"+"="*50)
-test_g=G_test[0];test_g=test_g.to(device)
+test_g=G_test[0].clone().to(device)
 if test_g.edge_index.shape[1]>1024:
     idx=torch.randperm(test_g.edge_index.shape[1])[:1024];test_g.edge_index=test_g.edge_index[:,idx];test_g.edge_attr=test_g.edge_attr[idx];test_g.edge_time=test_g.edge_time[idx]
 
@@ -295,7 +313,7 @@ try:
     val_embs,val_lbls=[],[]
     with torch.no_grad():
         for g in G_val:
-            g=g.to(device)
+            g=g.clone().to(device)
             if g.edge_index.shape[1]>2000:
                 idx=torch.randperm(g.edge_index.shape[1])[:2000];g.edge_index=g.edge_index[:,idx];g.edge_attr=g.edge_attr[idx];g.edge_time=g.edge_time[idx];g.y=g.y[idx]
             reps=encoder(encode(g.edge_attr,g.edge_time,g.edge_index,g.num_nodes))

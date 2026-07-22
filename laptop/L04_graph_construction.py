@@ -133,7 +133,7 @@ def build_windowed_graphs(df_split, split_name, dataset_name):
             edge_attr=torch.tensor(X[w_indices], dtype=torch.float32),
             y=torch.tensor(labels[w_indices], dtype=torch.long),
             y_binary=torch.tensor(is_attack[w_indices], dtype=torch.long),
-            edge_time=torch.tensor(time_ms[w_indices], dtype=torch.float32),
+            edge_time=torch.tensor(time_ms[w_indices], dtype=torch.float64),
             num_nodes=len(node_ids),
             window_idx=w,
         )
@@ -150,8 +150,30 @@ def build_windowed_graphs(df_split, split_name, dataset_name):
     return graphs
 
 
-def process_dataset(name):
-    """Process one dataset: load splits, build graphs, fit scaler, save."""
+def fit_global_scaler():
+    print(f"\n{'='*60}\nFitting Global StandardScaler on E_train\n{'='*60}")
+    scaler = StandardScaler()
+    for name in DATASETS:
+        split_path = SPLITS_DIR / f'{name}_train_index.parquet'
+        cleaned_path = CLEANED_DIR / f'{name}_cleaned'
+        if not split_path.exists() or not cleaned_path.exists():
+            print(f"  SKIPPED: Missing files for {name}")
+            return None
+        df = pd.read_parquet(cleaned_path)
+        split_df = pd.read_parquet(split_path)
+        train_features = df.iloc[split_df['row_index'].values][KEPT_FEATURES].values.astype(np.float32)
+        scaler.partial_fit(train_features)
+        print(f"  Partial fit on {name}: {train_features.shape[0]:,} samples")
+        del df, split_df, train_features; gc.collect()
+    
+    scaler_path = GRAPHS_DIR / 'scaler.pkl'
+    with open(scaler_path, 'wb') as f:
+        pickle.dump(scaler, f)
+    print(f"  Global scaler saved: {scaler_path}")
+    return scaler
+
+def process_dataset(name, scaler):
+    """Process one dataset: load splits, build graphs, apply global scaler, save."""
     cleaned_path = CLEANED_DIR / f'{name}_cleaned'
     if not cleaned_path.exists():
         print(f"  SKIPPED: {cleaned_path} not found. Run L01 first.")
@@ -181,37 +203,16 @@ def process_dataset(name):
     # Free full df
     del df; gc.collect()
 
-    # ---- Fit scaler on E_train ONLY ----
-    print(f"\n  Fitting StandardScaler on E_train...")
-    train_features = split_data['train'][KEPT_FEATURES].values.astype(np.float32)
-    scaler = StandardScaler()
-    scaler.fit(train_features)
-    print(f"  Scaler fit on {train_features.shape[0]:,} samples x {train_features.shape[1]} features")
-
-    # Save scaler
-    scaler_path = GRAPHS_DIR / 'scaler.pkl'
-    with open(scaler_path, 'wb') as f:
-        pickle.dump(scaler, f)
-    print(f"  Scaler saved: {scaler_path}")
-
-    # Save scaler metadata
-    scaler_meta = {
-        'n_samples_seen_': int(scaler.n_samples_seen_),
-        'feature_count': len(KEPT_FEATURES),
-        'mean_range': [float(scaler.mean_.min()), float(scaler.mean_.max())],
-        'scale_range': [float(scaler.scale_.min()), float(scaler.scale_.max())],
-    }
-    with open(GRAPHS_DIR / 'scaler_metadata.json', 'w') as f:
-        json.dump(scaler_meta, f, indent=2)
-
     # ---- Build and save graphs per split ----
     for split_name in SPLITS:
         print(f"\n  Building {split_name} graphs...")
 
-        # Apply scaler
+        # Apply global scaler and clamp
         df_split = split_data[split_name]
         feature_cols = [c for c in KEPT_FEATURES if c in df_split.columns]
-        df_split[feature_cols] = scaler.transform(df_split[feature_cols].values.astype(np.float32))
+        scaled = scaler.transform(df_split[feature_cols].values.astype(np.float32))
+        scaled = np.clip(scaled, -10.0, 10.0)  # Stop outlier explosion
+        df_split[feature_cols] = scaled
 
         # Build windowed graphs
         graphs = build_windowed_graphs(df_split, split_name, name)
@@ -236,9 +237,14 @@ if __name__ == '__main__':
     print(f"Window size: {WINDOW_SIZE_SEC}s")
     print(f"Datasets: {DATASETS}")
 
+    global_scaler = fit_global_scaler()
+    if global_scaler is None:
+        print("Failed to fit global scaler. Exiting.")
+        sys.exit(1)
+
     results = {}
     for ds_name in DATASETS:
-        ok = process_dataset(ds_name)
+        ok = process_dataset(ds_name, global_scaler)
         results[ds_name] = ok
 
     print("\n" + "="*60)

@@ -20,9 +20,7 @@ import torch_geometric; from torch_geometric.nn import GATv2Conv; from torch_geo
 SEED=42;random.seed(SEED);np.random.seed(SEED);torch.manual_seed(SEED)
 if torch.cuda.is_available():torch.cuda.manual_seed_all(SEED)
 
-WORKING=Path('/kaggle/working');INPUT=Path('/kaggle/input/datasets/mysteriousavailable/ids-nf3-processed/ids-nf3-processed')
-CKPT_DIR=WORKING/'checkpoints'/'H_prototypical'
-LOGS_DIR=WORKING/'logs';FIGS_DIR=WORKING/'outputs'/'figures';TABS_DIR=WORKING/'outputs'/'tables'
+WORKING=Path('../working');INPUT = Path('/kaggle/input/datasets/mysteriousavailable/ids-nf3-processed/ids-nf3-processed')
 for d in [CKPT_DIR,LOGS_DIR,FIGS_DIR,TABS_DIR]:d.mkdir(parents=True,exist_ok=True)
 device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -41,34 +39,49 @@ class Time2Vec(nn.Module):
         return torch.cat([self.w0*t+self.b0,torch.sin(self.omega*t+self.bias)],dim=-1)
 
 class EGATv2Encoder(nn.Module):
-    def __init__(self,edge_dim=58,node_init=128,hidden=256,heads=8,layers=3,d_attn=0.3,d_feat=0.2):
+    def __init__(self, max_nodes, edge_dim=58, node_init=128, hidden=256, heads=8, layers=3,
+                 d_attn=0.3, d_feat=0.2, return_attention=False):
         super().__init__()
-        self.hidden=hidden;self.heads=heads;self.layers=layers;self.output_dim=hidden*3
-        self.node_init=node_init;self.node_embed=None
-        self.edge_proj=nn.Linear(edge_dim,hidden)
-        self.convs=nn.ModuleList();self.norms=nn.ModuleList();self.dropout=nn.Dropout(d_feat)
+        assert max_nodes is not None and max_nodes > 0, "max_nodes must be a positive int"
+        self.hidden=hidden; self.heads=heads; self.layers=layers
+        self.output_dim = hidden*3  # 768
+        self.node_init = node_init
+        self.max_nodes = max_nodes
+        self.return_attention = return_attention
+
+        self.node_embed = nn.Parameter(torch.randn(max_nodes, node_init) * 0.1)
+        self.edge_proj = nn.Linear(edge_dim, hidden)
+        self.convs = nn.ModuleList(); self.norms = nn.ModuleList()
+        self.dropout = nn.Dropout(d_feat)
         for _ in range(layers):
-            self.convs.append(GATv2Conv((-1,-1),hidden//heads,heads=heads,edge_dim=hidden,dropout=d_attn,concat=True))
+            self.convs.append(GATv2Conv((-1,-1), hidden//heads, heads=heads,
+                edge_dim=hidden, dropout=d_attn, concat=True))
             self.norms.append(nn.LayerNorm(hidden))
-        self.activation=nn.ELU()
-    def _get_node_embed(self,n,dev):
-        if self.node_embed is None or self.node_embed.shape[0]<n:
-            new=nn.Parameter(torch.randn(n,self.node_init,device=dev)*0.1)
-            if self.node_embed is not None:new.data[:self.node_embed.shape[0]]=self.node_embed.data
-            self.node_embed=new
-        return self.node_embed[:n]
-    def forward(self,data):
-        x=self._get_node_embed(data.num_nodes,data.edge_index.device)
-        ea=self.edge_proj(data.edge_attr)
-        for conv,norm in zip(self.convs,self.norms):
-            x_new,_=conv(x,data.edge_index,edge_attr=ea,return_attention_weights=True)
-            x_new=self.activation(x_new);x_new=self.dropout(x_new);x_new=norm(x_new)
-            x=x+x_new if x.shape==x_new.shape else x_new
-        return torch.cat([x[data.edge_index[0]],x[data.edge_index[1]],ea],dim=-1)
+        self.activation = nn.ELU()
+
+    def forward(self, data):
+        n = data.num_nodes
+        table_size = self.node_embed.shape[0]
+        if n <= table_size:
+            x = self.node_embed[:n]
+        else:
+            idx = torch.arange(n, device=self.node_embed.device) % table_size
+            x = self.node_embed[idx]
+        ea = self.edge_proj(data.edge_attr)
+        for conv, norm in zip(self.convs, self.norms):
+            if self.return_attention:
+                x_new, _ = conv(x, data.edge_index, edge_attr=ea, return_attention_weights=True)
+            else:
+                x_new = conv(x, data.edge_index, edge_attr=ea)
+            x_new = self.activation(x_new); x_new = self.dropout(x_new)
+            x = norm(x + x_new) if x.shape == x_new.shape else norm(x_new)
+        return torch.cat([x[data.edge_index[0]], x[data.edge_index[1]], ea], dim=-1)
 
 # %% [cell 4] Load frozen encoder + extract embeddings
 ckpt_g=torch.load(WORKING/'checkpoints'/'G_multiclass'/'best.pt',map_location=device,weights_only=False)
-t2v=Time2Vec(k=16).to(device);encoder=EGATv2Encoder(edge_dim=EDGE_DIM).to(device)
+t2v=Time2Vec(k=16).to(device)
+enc_max_nodes = ckpt_g['encoder']['node_embed'].shape[0]
+encoder=EGATv2Encoder(max_nodes=enc_max_nodes, edge_dim=EDGE_DIM).to(device)
 t2v.load_state_dict(ckpt_g['t2v']);encoder.load_state_dict(ckpt_g['encoder'],strict=False)
 for p in list(t2v.parameters())+list(encoder.parameters()):p.requires_grad=False
 t2v.eval();encoder.eval()
@@ -90,14 +103,26 @@ import gc
 
 # Load, extract, delete sequentially to keep RAM low
 print("Extracting train embeddings...")
-G_train=torch.load(INPUT/'NF-CICIDS2018_train_list.pt',weights_only=False)+torch.load(INPUT/'NF-UNSW-NB15_train_list.pt',weights_only=False)
-train_emb,train_lbl=extract_embeddings(G_train)
-del G_train; gc.collect(); torch.cuda.empty_cache()
+train_e, train_l = [], []
+for ds in ['NF-CICIDS2018', 'NF-UNSW-NB15']:
+    p = INPUT/f'{ds}_train_list.pt'
+    if p.exists():
+        gl = torch.load(p,weights_only=False)
+        e,l = extract_embeddings(gl)
+        train_e.append(e); train_l.append(l)
+        del gl; gc.collect(); torch.cuda.empty_cache()
+train_emb=torch.cat(train_e); train_lbl=torch.cat(train_l)
 
 print("Extracting val embeddings...")
-G_val=torch.load(INPUT/'NF-CICIDS2018_val_list.pt',weights_only=False)+torch.load(INPUT/'NF-UNSW-NB15_val_list.pt',weights_only=False)
-val_emb,val_lbl=extract_embeddings(G_val)
-del G_val; gc.collect(); torch.cuda.empty_cache()
+val_e, val_l = [], []
+for ds in ['NF-CICIDS2018', 'NF-UNSW-NB15']:
+    p = INPUT/f'{ds}_val_list.pt'
+    if p.exists():
+        gl = torch.load(p,weights_only=False)
+        e,l = extract_embeddings(gl)
+        val_e.append(e); val_l.append(l)
+        del gl; gc.collect(); torch.cuda.empty_cache()
+val_emb=torch.cat(val_e); val_lbl=torch.cat(val_l)
 print(f"Train: {train_emb.shape}, Val: {val_emb.shape}")
 
 # Organize by class
@@ -126,7 +151,7 @@ HP={'n_way':5,'n_shot':5,'n_query':15,'ep_per_epoch':200,'epochs':30,'lr':1e-4}
 pn=ProtoNet().to(device);opt=optim.Adam(pn.parameters(),lr=HP['lr'])
 sched=optim.lr_scheduler.CosineAnnealingLR(opt,T_max=HP['epochs'])
 
-train_accs,val_accs=[],[]
+train_accs,val_accs=[]; best_val_acc = 0.0
 print(f"Prototypical training: {HP['epochs']} epochs, {HP['ep_per_epoch']} eps/epoch")
 
 for epoch in range(HP['epochs']):
@@ -170,8 +195,9 @@ for epoch in range(HP['epochs']):
             va+=(logits.argmax(1)==torch.tensor(qlv).to(device)).float().mean().item();nv+=1
     val_accs.append(va/max(nv,1))
     print(f"Epoch {epoch+1:2d}: Train={train_accs[-1]:.4f} Val={val_accs[-1]:.4f}")
-
-torch.save({'model':pn.state_dict(),'train_accs':train_accs,'val_accs':val_accs,'config':HP},CKPT_DIR/'best.pt')
+    if val_accs[-1] > best_val_acc:
+        best_val_acc = val_accs[-1]
+        torch.save({'model':pn.state_dict(),'train_accs':train_accs,'val_accs':val_accs,'config':HP},CKPT_DIR/'best.pt')
 
 # %% [cell 7] Leave-One-Class-Out Novelty Threshold Tuning
 pn.eval()
@@ -180,15 +206,17 @@ pn.eval()
 novel_sims,known_sims=[],[]
 locoo_results=[]
 
-for held_out in attack_classes:
+all_classes = list(val_by_cls.keys())
+for held_out in all_classes:
     if held_out not in val_by_cls:continue
 
     # Compute prototypes from ALL classes EXCEPT the held-out one
     held_protos={}
     with torch.no_grad():
-        for cls in attack_classes:
-            if cls==held_out:continue
-            idx=torch.randperm(train_by_cls[cls].shape[0])[:5]
+        for cls in all_classes:
+            if cls==held_out or cls not in train_by_cls:continue
+            # Using full support set (up to 50) for stable prototypes
+            idx=torch.randperm(train_by_cls[cls].shape[0])[:50]
             proto=pn.ap(train_by_cls[cls][idx].to(device))
             held_protos[cls]=F.normalize(proto,dim=-1)
 
@@ -207,7 +235,7 @@ for held_out in attack_classes:
 
     # Compute max similarity for KNOWN classes (should be high)
     held_known_sims=[]
-    for cls in attack_classes:
+    for cls in all_classes:
         if cls==held_out or cls not in val_by_cls:continue
         kd=val_by_cls[cls][:100]
         with torch.no_grad():

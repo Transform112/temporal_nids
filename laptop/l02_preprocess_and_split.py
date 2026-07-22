@@ -290,6 +290,10 @@ def build_graphs_for_dataset(ds_name, split_name):
 
             src_nodes = [hash_endpoint(ip, port) for ip, port in zip(src_ips, src_ports)]
             dst_nodes = [hash_endpoint(ip, port) for ip, port in zip(dst_ips, dst_ports)]
+            
+            node_id_cache = {}  # PREP-1 fix: Reset per window
+            src_nodes = [hash_endpoint(ip, port) for ip, port in zip(src_ips, src_ports)]
+            dst_nodes = [hash_endpoint(ip, port) for ip, port in zip(dst_ips, dst_ports)]
 
             edge_index = np.stack([src_nodes, dst_nodes], axis=0)  # (2, E)
 
@@ -298,7 +302,7 @@ def build_graphs_for_dataset(ds_name, split_name):
             edge_attr = w_data[feat_cols_in_chunk].values.astype(np.float32)  # (E, 41)
 
             # Edge times
-            edge_time = w_data[TIME_FIELD].values.astype(np.float32)  # (E,)
+            edge_time = w_data[TIME_FIELD].values.astype(np.float64)  # (E,)
 
             # Labels
             unified_labels = w_data['unified_label'].values
@@ -356,6 +360,7 @@ for ds_name in TRAIN_DATASETS:
             all_train_features.append(g.edge_attr.numpy())
 
 all_train_features = np.concatenate(all_train_features, axis=0)
+assert all_train_features.shape[0] > 10_000_000, "Scaler should be fit on both datasets"
 print(f"  E_train samples for scaler: {all_train_features.shape[0]:,} x {all_train_features.shape[1]}")
 
 scaler = StandardScaler()
@@ -376,10 +381,10 @@ for ds_name in TRAIN_DATASETS:
         if graph_path.exists():
             graphs = torch.load(graph_path, weights_only=False)
             for g in graphs:
-                g.edge_attr = torch.tensor(
+                g.edge_attr = torch.clamp(torch.tensor(
                     scaler.transform(g.edge_attr.numpy()),
                     dtype=torch.float32
-                )
+                ), -10.0, 10.0)
             torch.save(graphs, graph_path)
             print(f"    {ds_name}_{split_name} — normalized")
 
