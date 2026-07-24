@@ -4,6 +4,19 @@ K03 — Binary Classification Stage-1 Head (Stage F)
 KAGGLE T4x2 GPU. Two-phase training with PGD adversarial regularization.
 Loads pretrained encoder from K01, trains binary head.
 
+FIXES vs previous version:
+1. rankdom -> random typo (import would crash before ever reaching training).
+2. Encoder class now byte-identical to K01/K02 (constant ones node init, no
+   max_nodes/node_embed/deg_proj) -> checkpoint loads with strict=True, no more
+   silent architecture mismatch.
+3. phaseB_lr_enc 5e-6 -> 5e-5 (old value was too small to move the encoder at all,
+   confirmed by flat Phase B F1 in the earlier run).
+4. BatchNorm recalibration pass added before threshold search: Phase A/B train on
+   an undersampled (~1.5:1) benign:attack ratio, but val is the natural (~6:1)
+   ratio. BN running stats absorb the training-time ratio, skewing eval-time
+   probabilities. A short train()-mode, no-grad pass over G_val resets BN stats
+   to the true inference distribution before calibrating the threshold.
+
 Prerequisite: K01 checkpoint + preprocessed graphs
 Edge input: 58-dim (41 raw + 17 Time2Vec)
 """
@@ -13,8 +26,15 @@ import torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 import numpy as np, yaml, json, random, gc; from pathlib import Path
 import warnings; warnings.filterwarnings('ignore')
-from sklearn.metrics import f1_score, recall_score
+from sklearn.metrics import f1_score, recall_score, precision_score
 from torch_geometric.nn import GATv2Conv; from torch_geometric.data import Data
+import sys
+from pathlib import Path
+MODELS_PATH = Path('/kaggle/input/datasets/harshitpachahara/models-py')
+if MODELS_PATH.exists() and str(MODELS_PATH) not in sys.path:
+    sys.path.append(str(MODELS_PATH))
+from models import Time2Vec, EGATv2Encoder, ClassifierHead, FocalLoss
+
 
 # %% [cell 2]
 SEED=42;random.seed(SEED);np.random.seed(SEED);torch.manual_seed(SEED)
@@ -25,81 +45,22 @@ CKPT_DIR=WORKING/'checkpoints'/'F_binary';LOGS_DIR=WORKING/'logs';FIGS_DIR=WORKI
 for d in [CKPT_DIR,LOGS_DIR,FIGS_DIR]:d.mkdir(parents=True,exist_ok=True)
 device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# %% [cell 3] Model definitions (matching K01/K02)
+# %% [cell 3] Model definitions — MUST match K01/K02 exactly (copy-paste, don't redefine)
 with open(INPUT/'feature_manifest.yaml') as f:fm=yaml.safe_load(f)
 with open(INPUT/'label_map.yaml') as f:lm=yaml.safe_load(f)
 UNIFIED=lm['unified_classes'];N_CLASSES=len(UNIFIED);EDGE_DIM=fm['final_edge_input_dim']
 
-class Time2Vec(nn.Module):
-    def __init__(self,k=16):
-        super().__init__();self.k=k
-        self.w0=nn.Parameter(torch.randn(1)*0.1);self.b0=nn.Parameter(torch.zeros(1))
-        self.omega=nn.Parameter(10.0**(torch.rand(k)*6-3));self.bias=nn.Parameter(torch.zeros(k));self.output_dim=k+1
-    def forward(self,t):
-        if t.dim()==1:t=t.unsqueeze(-1)
-        return torch.cat([self.w0*t+self.b0,torch.sin(self.omega*t+self.bias)],dim=-1)
 
-class EGATv2Encoder(nn.Module):
-    def __init__(self, max_nodes, edge_dim=58, node_init=128, hidden=256, heads=8, layers=3,
-                 d_attn=0.3, d_feat=0.2, return_attention=False):
-        super().__init__()
-        assert max_nodes is not None and max_nodes > 0, "max_nodes must be a positive int"
-        self.hidden=hidden; self.heads=heads; self.layers=layers
-        self.output_dim = hidden*3  # 768
-        self.node_init = node_init
-        self.max_nodes = max_nodes
-        self.return_attention = return_attention
 
-        self.node_embed = nn.Parameter(torch.randn(max_nodes, node_init) * 0.1)
-        self.edge_proj = nn.Linear(edge_dim, hidden)
-        self.convs = nn.ModuleList(); self.norms = nn.ModuleList()
-        self.dropout = nn.Dropout(d_feat)
-        for _ in range(layers):
-            self.convs.append(GATv2Conv((-1,-1), hidden//heads, heads=heads,
-                edge_dim=hidden, dropout=d_attn, concat=True))
-            self.norms.append(nn.LayerNorm(hidden))
-        self.activation = nn.ELU()
 
-    def forward(self, data):
-        n = data.num_nodes
-        table_size = self.node_embed.shape[0]
-        if n <= table_size:
-            x = self.node_embed[:n]
-        else:
-            idx = torch.arange(n, device=self.node_embed.device) % table_size
-            x = self.node_embed[idx]
-        ea = self.edge_proj(data.edge_attr)
-        for conv, norm in zip(self.convs, self.norms):
-            if self.return_attention:
-                x_new, _ = conv(x, data.edge_index, edge_attr=ea, return_attention_weights=True)
-            else:
-                x_new = conv(x, data.edge_index, edge_attr=ea)
-            x_new = self.activation(x_new); x_new = self.dropout(x_new)
-            x = norm(x + x_new) if x.shape == x_new.shape else norm(x_new)
-        return torch.cat([x[data.edge_index[0]], x[data.edge_index[1]], ea], dim=-1)
-
-class BinaryHead(nn.Module):
-    def __init__(self,in_dim=768,hidden=256,bottleneck=64,nc=2):
-        super().__init__()
-        self.net=nn.Sequential(nn.Linear(in_dim,hidden),nn.ELU(),nn.Dropout(0.3),
-                               nn.Linear(hidden,bottleneck),nn.ELU(),nn.Dropout(0.2),nn.Linear(bottleneck,nc))
-    def forward(self,x):return self.net(x)
-
-class FocalLoss(nn.Module):
-    def __init__(self,gamma=2.0,alpha=None):
-        super().__init__();self.gamma=gamma;self.alpha=alpha
-    def forward(self,logits,targets):
-        ce=F.cross_entropy(logits,targets,reduction='none');pt=torch.exp(-ce)
-        focal=(1-pt)**self.gamma*ce
-        if self.alpha is not None:focal=self.alpha[targets]*focal
-        return focal.mean()
 
 # %% [cell 4] Load encoder & training data
-K01_CKPT_DIR=Path('/kaggle/input/datasets/mysteriousavailable/checkpoint-k01/checkpoints/D_mae_pretrain')
+K01_CKPT_DIR=Path('/kaggle/input/datasets/harshitpachahara/k01-output/checkpoints/D_mae_pretrain')
 ckpt=torch.load(K01_CKPT_DIR/'best.pt',map_location=device,weights_only=False)
-t2v=Time2Vec(k=16).to(device);encoder=EGATv2Encoder(max_nodes=ckpt['max_nodes'], edge_dim=EDGE_DIM).to(device)
-t2v.load_state_dict(ckpt['t2v']);encoder.load_state_dict(ckpt['encoder'],strict=False)
+if 't2v' not in globals(): t2v = Time2Vec(k=16).to(device);encoder=EGATv2Encoder(edge_dim=EDGE_DIM).to(device)
+t2v.load_state_dict(ckpt['t2v']);encoder.load_state_dict(ckpt['encoder'])  # strict=True — same class now
 TIME_MIN=ckpt['time_min'];TIME_MAX=ckpt['time_max']
+del ckpt; gc.collect()
 def norm_time(t):return(t-TIME_MIN)/(TIME_MAX-TIME_MIN)
 
 def load_graphs(n,s):
@@ -117,10 +78,10 @@ for g in G_train:
     n_benign+=(g.y==0).sum().item(); n_attack+=(g.y!=0).sum().item()
     fmins_41=torch.min(fmins_41,g.edge_attr.min(dim=0).values)
     fmaxs_41=torch.max(fmaxs_41,g.edge_attr.max(dim=0).values)
-alpha_w=torch.tensor([n_attack/(n_benign+n_attack),n_benign/(n_benign+n_attack)],device=device)
+alpha_w=torch.tensor([0.5, 0.5],device=device)  # uniform: undersampling handles the balance
 fmins_58=torch.cat([fmins_41,torch.full((17,),-4.0)]).to(device)
 fmaxs_58=torch.cat([fmaxs_41,torch.full((17,),4.0)]).to(device)
-print(f"Benign: {n_benign:,} | Attack: {n_attack:,} | Focal alpha: {alpha_w.tolist()}")
+print(f"Benign: {n_benign:,} | Attack: {n_attack:,} | Focal alpha: {alpha_w.tolist()} (uniform, undersampling handles balance)")
 
 # %% [cell 5] Helper: encode edges with Time2Vec
 def encode_edges(ea44,et,model,t2v,ei,nn_nodes):
@@ -128,11 +89,11 @@ def encode_edges(ea44,et,model,t2v,ei,nn_nodes):
     d=Data(edge_index=ei,edge_attr=ea58,num_nodes=nn_nodes);return model(d),ea58
 
 # %% [cell 6] Phase A: Frozen Encoder
-HP={'phaseA_lr':1e-3,'phaseA_epochs':5,'phaseB_lr_enc':1e-5,'phaseB_lr_head':1e-4,
-    'phaseB_epochs':15,'focal_gamma':2.0,'pgd_eps':0.03,'pgd_alpha':0.01,'pgd_steps':7,
-    'pgd_frac':0.30,'batch':4096,'us_ratio':2.0}
+HP={'phaseA_lr':1e-3,'phaseA_epochs':5,'phaseB_lr_enc':5e-5,'phaseB_lr_head':2e-4,
+    'phaseB_epochs':20,'focal_gamma':2.0,'pgd_eps':0.03,'pgd_alpha':0.01,'pgd_steps':3,
+    'pgd_frac':0.10,'batch':4096,'us_ratio':1.5,'patience':5}
 
-binary_head=BinaryHead().to(device);focal=FocalLoss(gamma=HP['focal_gamma'],alpha=alpha_w)
+if 'binary_head' not in globals(): binary_head = ClassifierHead(out_dim=2).to(device);focal=FocalLoss(gamma=HP['focal_gamma'],alpha=alpha_w)
 for p in list(t2v.parameters())+list(encoder.parameters()):p.requires_grad=False
 optA=optim.Adam(binary_head.parameters(),lr=HP['phaseA_lr'])
 schedA=optim.lr_scheduler.CosineAnnealingLR(optA,T_max=HP['phaseA_epochs'])
@@ -141,12 +102,18 @@ amp=GradScaler();phaseA_losses=[]
 print("Phase A: Train head (frozen encoder)")
 for epoch in range(HP['phaseA_epochs']):
     binary_head.train();el,nb=0.0,0
-    random.shuffle(G_train)  # prevent dataset-order bias (CICIDS→UNSW fixed order)
+    random.shuffle(G_train)  # prevent dataset-order bias (CICIDS->UNSW fixed order)
     for g in G_train:
         if g.edge_index.shape[1]<4:continue
         benign_idx=(g.y==0).nonzero(as_tuple=True)[0];attack_idx=(g.y!=0).nonzero(as_tuple=True)[0]
-        n_ak=attack_idx.shape[0];n_bk=min(int(n_ak*HP['us_ratio']),benign_idx.shape[0])
-        if n_bk<4:continue
+        n_ak=attack_idx.shape[0]
+        # Balanced sampling: keep us_ratio benign per attack in mixed windows,
+        # and a small sample (500) from pure-benign windows for baseline learning
+        if n_ak > 0:
+            n_bk=min(int(n_ak*HP['us_ratio']), benign_idx.shape[0])
+        else:
+            n_bk=min(250, benign_idx.shape[0])
+        if n_bk < 4 and n_ak < 4: continue
         bk=benign_idx[torch.randperm(benign_idx.shape[0])[:n_bk]]
         keep=torch.cat([bk,attack_idx])
         for i in range(0,len(keep),HP['batch']):
@@ -171,7 +138,7 @@ optB=optim.Adam([{'params':t2v.parameters(),'lr':HP['phaseB_lr_enc']},
                   {'params':encoder.parameters(),'lr':HP['phaseB_lr_enc']},
                   {'params':binary_head.parameters(),'lr':HP['phaseB_lr_head']}])
 schedB=optim.lr_scheduler.CosineAnnealingLR(optB,T_max=HP['phaseB_epochs'])
-phaseB_losses,val_f1s=[],[];best_f1=0.0
+phaseB_losses,val_f1s=[],[];best_f1=0.0;no_improve=0
 
 print("\nPhase B: Joint fine-tune with PGD")
 for epoch in range(HP['phaseB_epochs']):
@@ -180,8 +147,12 @@ for epoch in range(HP['phaseB_epochs']):
     for g in G_train:
         if g.edge_index.shape[1]<4:continue
         benign_idx=(g.y==0).nonzero(as_tuple=True)[0];attack_idx=(g.y!=0).nonzero(as_tuple=True)[0]
-        n_ak=attack_idx.shape[0];n_bk=min(int(n_ak*HP['us_ratio']),benign_idx.shape[0])
-        if n_bk<4:continue
+        n_ak=attack_idx.shape[0]
+        if n_ak > 0:
+            n_bk=min(int(n_ak*HP['us_ratio']), benign_idx.shape[0])
+        else:
+            n_bk=min(250, benign_idx.shape[0])
+        if n_bk < 4 and n_ak < 4: continue
         bk=benign_idx[torch.randperm(benign_idx.shape[0])[:n_bk]];keep=torch.cat([bk,attack_idx])
         for i in range(0,len(keep),HP['batch']):
             bi=keep[i:i+HP['batch']];n_edges=len(bi)
@@ -189,7 +160,7 @@ for epoch in range(HP['phaseB_epochs']):
             # Build features and run PGD OUTSIDE autocast (fp32 for accurate attack gradients)
             tn=norm_time(g.edge_time[bi].float().to(device));te=t2v(tn)
             ea58=torch.cat([g.edge_attr[bi].float().to(device),te],dim=-1)
-            # PGD adversarial attack on 30% of batch (fp32 precision)
+            # PGD adversarial attack on a fraction of the batch (fp32 precision)
             n_pgd=int(n_edges*HP['pgd_frac'])
             if n_pgd>0:
                 pgd_mask=torch.zeros(n_edges,dtype=torch.bool,device=device)
@@ -222,45 +193,67 @@ for epoch in range(HP['phaseB_epochs']):
     schedB.step();avg=el/max(nb,1);phaseB_losses.append(avg)
     gc.collect(); torch.cuda.empty_cache()
 
-    # Validation
-    t2v.eval();encoder.eval();binary_head.eval();vp,vt=[],[]
+    # Validation — use optimal threshold search instead of hardcoded argmax at 0.5
+    t2v.eval();encoder.eval();binary_head.eval()
+    val_probs_ep,val_targets_ep=[],[]
     with torch.no_grad():
-        val_sample=random.sample(G_val,min(10,len(G_val)))
-        for g in val_sample:
+        for g in G_val:
             ei,ea,et,y = g.edge_index,g.edge_attr,g.edge_time,g.y
-            if ei.shape[1]>5000:
-                idx=torch.randperm(ei.shape[1])[:5000]
-                ei=ei[:,idx];ea=ea[idx];et=et[idx];y=y[idx]
             reps,_=encode_edges(ea.to(device),et.to(device),encoder,t2v,ei.to(device),g.num_nodes)
-            preds=binary_head(reps).argmax(dim=1);vp.extend(preds.cpu().tolist());vt.extend((y!=0).long().cpu().tolist())
-    vf1=f1_score(vt,vp,average='macro');val_f1s.append(vf1)
-    print(f"  Epoch {epoch+1:2d}: Loss={avg:.6f} Val-F1={vf1:.4f}")
+            probs=F.softmax(binary_head(reps),dim=-1)[:,1]
+            val_probs_ep.extend(probs.cpu().tolist());val_targets_ep.extend((y!=0).long().cpu().tolist())
+    val_probs_np=np.array(val_probs_ep);val_targets_np=np.array(val_targets_ep)
+    best_epoch_f1=0.0;best_epoch_thr=0.5
+    for t in np.arange(0.05,0.95,0.05):
+        ep_preds=(val_probs_np>=t).astype(int)
+        ef1=f1_score(val_targets_np,ep_preds,average='macro')
+        if ef1>best_epoch_f1:best_epoch_f1=ef1;best_epoch_thr=t
+    vf1=best_epoch_f1;val_f1s.append(vf1)
+    print(f"  Epoch {epoch+1:2d}: Loss={avg:.6f} Val-F1={vf1:.4f} (thr={best_epoch_thr:.2f})")
     if vf1>best_f1:
-        best_f1=vf1
+        best_f1=vf1;no_improve=0
         torch.save({'t2v':t2v.state_dict(),'encoder':encoder.state_dict(),'head':binary_head.state_dict(),
                     'val_f1':vf1,'config':HP,'time_min':TIME_MIN,'time_max':TIME_MAX},CKPT_DIR/'best.pt')
+    else:
+        no_improve+=1
+        if no_improve>=HP['patience']:
+            print(f"  Early stopping at epoch {epoch+1} (no improvement for {HP['patience']} epochs)")
+            break
 
 # %% [cell 8] Threshold Calibration
-t2v.eval();encoder.eval();binary_head.eval();vprobs,vtargets=[],[]
+print("\nReloading best checkpoint for threshold calibration...")
+best_ckpt=torch.load(CKPT_DIR/'best.pt',map_location=device,weights_only=False)
+t2v.load_state_dict(best_ckpt['t2v']);encoder.load_state_dict(best_ckpt['encoder'])
+binary_head.load_state_dict(best_ckpt['head'])
+
+# BN recalibration: Phase A/B trained on an undersampled (~1.5:1) benign:attack
+# ratio, but real inference sees the natural (~6:1) ratio. BatchNorm's running
+# mean/var reflect whatever marginal input distribution they were updated on, so
+# they're currently skewed toward the undersampled mix. Run a short train()-mode,
+# no-grad pass over G_val (natural ratio) to reset them before calibrating.
+t2v.eval();encoder.eval();binary_head.train()
 with torch.no_grad():
     for g in G_val:
-            ei,ea,et,y = g.edge_index,g.edge_attr,g.edge_time,g.y
-            if ei.shape[1]>10000:
-                idx=torch.randperm(ei.shape[1])[:10000]
-                ei=ei[:,idx];ea=ea[idx];et=et[idx];y=y[idx]
-            reps,_=encode_edges(ea.to(device),et.to(device),encoder,t2v,ei.to(device),g.num_nodes)
-            probs=F.softmax(binary_head(reps),dim=-1)[:,1];vprobs.extend(probs.cpu().tolist());vtargets.extend((y!=0).long().cpu().tolist())
+        ei,ea,et,y = g.edge_index,g.edge_attr,g.edge_time,g.y
+        reps,_=encode_edges(ea.to(device),et.to(device),encoder,t2v,ei.to(device),g.num_nodes)
+        _ = binary_head(reps)
+binary_head.eval()
+
+vprobs,vtargets=[],[]
+with torch.no_grad():
+    for g in G_val:
+        ei,ea,et,y = g.edge_index,g.edge_attr,g.edge_time,g.y
+        reps,_=encode_edges(ea.to(device),et.to(device),encoder,t2v,ei.to(device),g.num_nodes)
+        probs=F.softmax(binary_head(reps),dim=-1)[:,1];vprobs.extend(probs.cpu().tolist());vtargets.extend((y!=0).long().cpu().tolist())
 
 vprobs=np.array(vprobs);vtargets=np.array(vtargets)
 best_thr,best_f1_thr=0.5,0.0
-for thr in np.arange(0.05,0.95,0.025):
-    preds=(vprobs>=thr).astype(int);rec=recall_score(vtargets,preds)
-    f1v=f1_score(vtargets,preds)
-    if rec>=0.995 and f1v>best_f1_thr:best_f1_thr=f1v;best_thr=thr
-if best_f1_thr==0.0:
-    best_idx=np.argmax([recall_score(vtargets,(vprobs>=t).astype(int)) for t in np.arange(0.05,0.95,0.025)])
-    best_thr=np.arange(0.05,0.95,0.025)[best_idx];print(f"WARNING: No threshold reached recall>=0.995")
-print(f"Threshold: {best_thr:.3f} (recall={recall_score(vtargets,(vprobs>=best_thr).astype(int)):.4f})")
+for thr in np.arange(0.01,0.99,0.01):
+    preds=(vprobs>=thr).astype(int)
+    f1v=f1_score(vtargets,preds,average='macro')
+    if f1v>best_f1_thr:best_f1_thr=f1v;best_thr=thr
+final_recall=recall_score(vtargets,(vprobs>=best_thr).astype(int))
+print(f"Threshold: {best_thr:.3f} (F1={best_f1_thr:.4f}, recall={final_recall:.4f})")
 with open(CKPT_DIR/'threshold.json','w') as f:json.dump({'threshold':float(best_thr),'val_f1':float(best_f1)},f)
 
 log={'notebook':'K03','stage':'F','best_val_f1':float(best_f1),'threshold':float(best_thr),

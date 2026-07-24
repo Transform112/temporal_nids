@@ -17,6 +17,14 @@ import warnings; warnings.filterwarnings('ignore')
 import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; import seaborn as sns
 from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix, classification_report
 import torch_geometric; from torch_geometric.nn import GATv2Conv; from torch_geometric.data import Data
+from torch_geometric.utils import degree
+import sys
+from pathlib import Path
+MODELS_PATH = Path('/kaggle/input/datasets/harshitpachahara/models-py')
+if MODELS_PATH.exists() and str(MODELS_PATH) not in sys.path:
+    sys.path.append(str(MODELS_PATH))
+from models import Time2Vec, EGATv2Encoder, ClassifierHead, FocalLoss
+
 
 # %% [cell 2]
 SEED=42;random.seed(SEED);np.random.seed(SEED);torch.manual_seed(SEED)
@@ -33,81 +41,25 @@ with open(INPUT/'feature_manifest.yaml') as f:fm=yaml.safe_load(f)
 with open(INPUT/'label_map.yaml') as f:lm=yaml.safe_load(f)
 UNIFIED=lm['unified_classes'];N_CLASSES=len(UNIFIED);EDGE_DIM=fm['final_edge_input_dim']
 
-class Time2Vec(nn.Module):
-    def __init__(self,k=16):
-        super().__init__();self.k=k;self.w0=nn.Parameter(torch.randn(1)*0.1)
-        self.b0=nn.Parameter(torch.zeros(1));self.omega=nn.Parameter(10.0**(torch.rand(k)*6-3))
-        self.bias=nn.Parameter(torch.zeros(k));self.output_dim=k+1
-    def forward(self,t):
-        if t.dim()==1:t=t.unsqueeze(-1)
-        return torch.cat([self.w0*t+self.b0,torch.sin(self.omega*t+self.bias)],dim=-1)
 
-class EGATv2Encoder(nn.Module):
-    def __init__(self, max_nodes, edge_dim=58, node_init=128, hidden=256, heads=8, layers=3,
-                 d_attn=0.3, d_feat=0.2, return_attention=False):
-        super().__init__()
-        assert max_nodes is not None and max_nodes > 0, "max_nodes must be a positive int"
-        self.hidden=hidden; self.heads=heads; self.layers=layers
-        self.output_dim = hidden*3  # 768
-        self.node_init = node_init
-        self.max_nodes = max_nodes
-        self.return_attention = return_attention
 
-        self.node_embed = nn.Parameter(torch.randn(max_nodes, node_init) * 0.1)
-        self.edge_proj = nn.Linear(edge_dim, hidden)
-        self.convs = nn.ModuleList(); self.norms = nn.ModuleList()
-        self.dropout = nn.Dropout(d_feat)
-        for _ in range(layers):
-            self.convs.append(GATv2Conv((-1,-1), hidden//heads, heads=heads,
-                edge_dim=hidden, dropout=d_attn, concat=True))
-            self.norms.append(nn.LayerNorm(hidden))
-        self.activation = nn.ELU()
 
-    def forward(self, data):
-        n = data.num_nodes
-        table_size = self.node_embed.shape[0]
-        if n <= table_size:
-            x = self.node_embed[:n]
-        else:
-            idx = torch.arange(n, device=self.node_embed.device) % table_size
-            x = self.node_embed[idx]
-        ea = self.edge_proj(data.edge_attr)
-        for conv, norm in zip(self.convs, self.norms):
-            if self.return_attention:
-                x_new, _ = conv(x, data.edge_index, edge_attr=ea, return_attention_weights=True)
-            else:
-                x_new = conv(x, data.edge_index, edge_attr=ea)
-            x_new = self.activation(x_new); x_new = self.dropout(x_new)
-            x = norm(x + x_new) if x.shape == x_new.shape else norm(x_new)
-        return torch.cat([x[data.edge_index[0]], x[data.edge_index[1]], ea], dim=-1)
 
-class MulticlassHead(nn.Module):
-    def __init__(self,in_dim=768,hidden=256,nc=11):
-        super().__init__()
-        self.net=nn.Sequential(nn.Linear(in_dim,hidden),nn.ELU(),nn.Dropout(0.3),nn.Linear(hidden,nc))
-    def forward(self,x):return self.net(x)
-
-class FocalLoss(nn.Module):
-    def __init__(self,gamma=2.0,alpha=None):
-        super().__init__();self.gamma=gamma;self.alpha=alpha
-    def forward(self,logits,targets):
-        ce=F.cross_entropy(logits,targets,reduction='none');pt=torch.exp(-ce)
-        focal=(1-pt)**self.gamma*ce
-        if self.alpha is not None:focal=self.alpha[targets]*focal
-        return focal.mean()
-
-# %% [cell 4] Load from K03 checkpoint
-ckpt_f=torch.load(WORKING/'checkpoints'/'F_binary'/'best.pt',map_location=device,weights_only=False)
-t2v=Time2Vec(k=16).to(device)
-enc_max_nodes = ckpt_f['encoder']['node_embed'].shape[0]
-encoder=EGATv2Encoder(max_nodes=enc_max_nodes, edge_dim=EDGE_DIM).to(device)
+# %% [cell 4] Load from K03 checkpoint (Uploaded Dataset)
+K03_CKPT = Path('/kaggle/input/datasets/harshitpachahara/k03-output/checkpoints/F_binary/best.pt')
+ckpt_f=torch.load(K03_CKPT,map_location=device,weights_only=False)
+if 't2v' not in globals(): t2v = Time2Vec(k=16).to(device)
+if 'encoder' not in globals(): encoder = EGATv2Encoder(edge_dim=EDGE_DIM).to(device)
 t2v.load_state_dict(ckpt_f['t2v']);encoder.load_state_dict(ckpt_f['encoder'],strict=False)
 TIME_MIN=ckpt_f['time_min'];TIME_MAX=ckpt_f['time_max']
 def norm_time(t):return(t-TIME_MIN)/(TIME_MAX-TIME_MIN)
 
-# Load synthetic embeddings from K02
-synth_data=torch.load(WORKING/'checkpoints'/'E_cvae'/'synthetic_embeddings.pt',weights_only=False)
-synth_emb = np.memmap(synth_data['embeddings_memmap_path'], dtype=synth_data['embeddings_dtype'], mode='r', shape=synth_data['embeddings_shape'])
+# Load synthetic embeddings from K02 (Uploaded Dataset)
+K02_DIR = Path('/kaggle/input/datasets/harshitpachahara/k02-output/checkpoints/E_cvae')
+synth_data=torch.load(K02_DIR/'synthetic_embeddings.pt',weights_only=False)
+# Override original absolute path saved in dict to point to current Kaggle input directory
+memmap_path = K02_DIR/'synthetic_embeddings.dat'
+synth_emb = np.memmap(memmap_path, dtype=synth_data['embeddings_dtype'], mode='r', shape=synth_data['embeddings_shape'])
 synth_emb = torch.from_numpy(synth_emb);synth_lbl=synth_data['labels']
 print(f"Synthetic: {synth_emb.shape[0]:,} embeddings")
 
@@ -133,8 +85,8 @@ print(f"Effective-number weights range: [{eff_weights.min():.3f}, {eff_weights.m
 gc.collect(); torch.cuda.empty_cache()  # clean up after graph loading
 
 # %% [cell 5] Training
-multiclass_head=MulticlassHead(nc=N_CLASSES).to(device);focal=FocalLoss(gamma=2.0,alpha=eff_weights)
-HP={'lr':1e-5,'epochs':20,'batch':2048,'pgd_eps':0.03,'pgd_alpha':0.01,'pgd_steps':7,'pgd_frac':0.30}
+if 'multiclass_head' not in globals(): multiclass_head = ClassifierHead(out_dim=N_CLASSES).to(device);focal=FocalLoss(gamma=2.0,alpha=eff_weights)
+HP={'lr':1e-5,'epochs':20,'batch':2048,'pgd_eps':0.03,'pgd_alpha':0.01,'pgd_steps':3,'pgd_frac':0.10}
 
 opt=optim.AdamW([{'params':t2v.parameters(),'lr':HP['lr']},
                   {'params':encoder.parameters(),'lr':HP['lr']},
@@ -142,8 +94,8 @@ opt=optim.AdamW([{'params':t2v.parameters(),'lr':HP['lr']},
 sched=optim.lr_scheduler.CosineAnnealingLR(opt,T_max=HP['epochs']);amp=GradScaler()
 
 def encode(ea,et,ei,nn):
-    tn=norm_time(et);te=t2v(tn)
-    ea58 = torch.cat([ea,te],dim=-1)
+    tn=norm_time(et.float());te=t2v(tn)
+    ea58 = torch.cat([ea.float(),te],dim=-1)
     return ea58,Data(edge_index=ei,edge_attr=ea58,num_nodes=nn)
 
 # Feature bounds from iterative computation above (no giant cat)
@@ -154,17 +106,33 @@ train_losses,val_f1s=[],[];best_f1=0.0
 synth_emb_dev=synth_emb.to(device);synth_lbl_dev=synth_lbl.to(device)
 
 print(f"\nMulticlass training: {HP['epochs']} epochs")
-for epoch in range(HP['epochs']):
+
+# Resume from checkpoint if exists
+if (CKPT_DIR / 'best.pt').exists():
+    print(f'Resuming training from {CKPT_DIR / "best.pt"}')
+    ckpt = torch.load(CKPT_DIR / 'best.pt', map_location=device, weights_only=False)
+    if 't2v' in ckpt: t2v.load_state_dict(ckpt['t2v'])
+    if 'encoder' in ckpt: encoder.load_state_dict(ckpt['encoder'])
+    if 'head' in ckpt: multiclass_head.load_state_dict(ckpt['head'])
+    if 'opt' in ckpt: opt.load_state_dict(ckpt['opt'])
+    if 'sched' in ckpt: sched.load_state_dict(ckpt['sched'])
+    if 'epoch' in ckpt: start_epoch = ckpt['epoch'] + 1
+    else: start_epoch = 0
+    if 'val_f1' in ckpt: best_f1 = ckpt['val_f1']
+else:
+    start_epoch = 0
+
+for epoch in range(start_epoch, HP['epochs']):
     t2v.train();encoder.train();multiclass_head.train();el,nb=0.0,0
     random.shuffle(G_train)  # prevent dataset-order bias (CICIDS→UNSW fixed order)
     for g in G_train:
-        g=g.to(device);n_edges=g.edge_index.shape[1]
+        n_edges=g.edge_index.shape[1]
         if n_edges<4:continue
         # Undersample to ~200 per class
         keep_idx=[]
         for cls in range(1, N_CLASSES):
             cm=(g.y==cls).nonzero(as_tuple=True)[0]
-            if len(cm)>0:nk=min(len(cm),200);keep_idx.append(cm[torch.randperm(len(cm))[:nk]])
+            if len(cm)>0:keep_idx.append(cm)
         if not keep_idx:continue
         keep=torch.cat(keep_idx)
         for i in range(0,len(keep),HP['batch']):
@@ -202,8 +170,8 @@ for epoch in range(HP['epochs']):
                     if cls_mask.sum()>0:
                         n_synth_needed=(yb==cls).sum().item()
                         synth_pool=synth_emb_dev[cls_mask]
-                        if synth_pool.shape[0]>=n_synth_needed:
-                            idx_s=torch.randperm(synth_pool.shape[0])[:n_synth_needed]
+                        if synth_pool.shape[0] > 0:
+                            idx_s=torch.randint(0, synth_pool.shape[0], (n_synth_needed,))
                             real_reps_list.append(synth_pool[idx_s])
                             real_labels_list.append(torch.full((n_synth_needed,),cls,dtype=torch.long,device=device))
                 all_reps=torch.cat(real_reps_list,dim=0)
@@ -221,33 +189,34 @@ for epoch in range(HP['epochs']):
     # Validation
     t2v.eval();encoder.eval();multiclass_head.eval();vp,vt=[],[]
     with torch.no_grad():
-        val_sample=random.sample(G_val,min(10,len(G_val)))
+        val_sample=G_val
         for g in val_sample:
-            g=g.to(device)
             ei,ea,et,y = g.edge_index,g.edge_attr,g.edge_time,g.y
-            if ei.shape[1]>5000:
-                idx=torch.randperm(ei.shape[1])[:5000]
-                ei=ei[:,idx];ea=ea[idx];et=et[idx];y=y[idx]
             ea58,data_b=encode(ea.to(device),et.to(device),ei.to(device),g.num_nodes)
             preds=multiclass_head(encoder(data_b)).argmax(dim=-1)
             vp.extend(preds.cpu().tolist());vt.extend(y.cpu().tolist())
-    vf1=f1_score(vt,vp,average='macro');val_f1s.append(vf1)
-    print(f"Epoch {epoch+1:2d}: Loss={avg:.6f} Val-F1={vf1:.4f}")
+    vf1=f1_score(vt,vp,average='macro',labels=list(range(1,N_CLASSES)));val_f1s.append(vf1)
+    per_class_f1 = f1_score(vt, vp, average=None, labels=list(range(1, N_CLASSES)))
+    f1_str = " ".join([f"C{i+1}:{f:.4f}" for i, f in enumerate(per_class_f1)])
+    print(f"Epoch {epoch+1:2d}: Loss={avg:.6f} Val-F1={vf1:.4f} | {f1_str}")
     if vf1>best_f1:
         best_f1=vf1
         torch.save({'t2v':t2v.state_dict(),'encoder':encoder.state_dict(),'head':multiclass_head.state_dict(),
+                    'opt':opt.state_dict(),'sched':sched.state_dict(),'epoch':epoch,
                     'val_f1':vf1,'config':HP,'time_min':TIME_MIN,'time_max':TIME_MAX},CKPT_DIR/'best.pt')
 
 # %% [cell 6] Per-Class Threshold Calibration
+# CRITICAL: Reload best checkpoint so thresholds are calibrated on the best model, not the last epoch
+print("\nReloading best checkpoint for threshold calibration...")
+best_ckpt=torch.load(CKPT_DIR/'best.pt',map_location=device,weights_only=False)
+t2v.load_state_dict(best_ckpt['t2v']);encoder.load_state_dict(best_ckpt['encoder'],strict=False)
+multiclass_head.load_state_dict(best_ckpt['head'])
+
 t2v.eval();encoder.eval();multiclass_head.eval()
 all_probs,all_targets=[],[]
 with torch.no_grad():
     for g in G_val:
-        g=g.to(device)
         ei,ea,et,y = g.edge_index,g.edge_attr,g.edge_time,g.y
-        if ei.shape[1]>10000:
-            idx=torch.randperm(ei.shape[1])[:10000]
-            ei=ei[:,idx];ea=ea[idx];et=et[idx];y=y[idx]
         ea58,data_b=encode(ea.to(device),et.to(device),ei.to(device),g.num_nodes)
         probs=F.softmax(multiclass_head(encoder(data_b)),dim=-1)
         all_probs.append(probs.cpu());all_targets.append(y.cpu())

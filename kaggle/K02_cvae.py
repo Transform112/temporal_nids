@@ -7,6 +7,13 @@ from torch_geometric.data import Data
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
+import sys
+from pathlib import Path
+MODELS_PATH = Path('/kaggle/input/datasets/harshitpachahara/models-py')
+if MODELS_PATH.exists() and str(MODELS_PATH) not in sys.path:
+    sys.path.append(str(MODELS_PATH))
+from models import Time2Vec, EGATv2Encoder, ClassifierHead, FocalLoss
+
 
 SEED=42; random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
@@ -22,53 +29,8 @@ with open(INPUT_DIR/'feature_manifest.yaml') as f: fm=yaml.safe_load(f)
 with open(INPUT_DIR/'label_map.yaml') as f: lm=yaml.safe_load(f)
 EDGE_DIM=fm['final_edge_input_dim']; UNIFIED=lm['unified_classes']; NC=len(UNIFIED)
 
-# ---- Model definitions (same as K01) ----
-class Time2Vec(nn.Module):
-    def __init__(self,k=16):
-        super().__init__(); self.k=k; self.w0=nn.Parameter(torch.randn(1)*0.1); self.b0=nn.Parameter(torch.zeros(1))
-        self.omega=nn.Parameter(10.0**(torch.rand(k)*6-3)); self.bias=nn.Parameter(torch.zeros(k)); self.output_dim=k+1
-    def forward(self,t):
-        if t.dim()==1:t=t.unsqueeze(-1)
-        return torch.cat([self.w0*t+self.b0,torch.sin(self.omega*t+self.bias)],dim=-1)
+# ---- Model definitions — MUST match K01 exactly (copy-paste, don't redefine) ----
 
-class EGATv2Encoder(nn.Module):
-    def __init__(self, max_nodes, edge_dim=58, node_init=128, hidden=256, heads=8, layers=3,
-                 d_attn=0.3, d_feat=0.2, return_attention=False):
-        super().__init__()
-        assert max_nodes is not None and max_nodes > 0, "max_nodes must be a positive int"
-        self.hidden=hidden; self.heads=heads; self.layers=layers
-        self.output_dim = hidden*3  # 768
-        self.node_init = node_init
-        self.max_nodes = max_nodes
-        self.return_attention = return_attention
-
-        self.node_embed = nn.Parameter(torch.randn(max_nodes, node_init) * 0.1)
-        self.edge_proj = nn.Linear(edge_dim, hidden)
-        self.convs = nn.ModuleList(); self.norms = nn.ModuleList()
-        self.dropout = nn.Dropout(d_feat)
-        for _ in range(layers):
-            self.convs.append(GATv2Conv((-1,-1), hidden//heads, heads=heads,
-                edge_dim=hidden, dropout=d_attn, concat=True))
-            self.norms.append(nn.LayerNorm(hidden))
-        self.activation = nn.ELU()
-
-    def forward(self, data):
-        n = data.num_nodes
-        table_size = self.node_embed.shape[0]
-        if n <= table_size:
-            x = self.node_embed[:n]
-        else:
-            idx = torch.arange(n, device=self.node_embed.device) % table_size
-            x = self.node_embed[idx]
-        ea = self.edge_proj(data.edge_attr)
-        for conv, norm in zip(self.convs, self.norms):
-            if self.return_attention:
-                x_new, _ = conv(x, data.edge_index, edge_attr=ea, return_attention_weights=True)
-            else:
-                x_new = conv(x, data.edge_index, edge_attr=ea)
-            x_new = self.activation(x_new); x_new = self.dropout(x_new)
-            x = norm(x + x_new) if x.shape == x_new.shape else norm(x_new)
-        return torch.cat([x[data.edge_index[0]], x[data.edge_index[1]], ea], dim=-1)
 
 class ConditionalVAE(nn.Module):
     def __init__(self,input_dim=768,condition_dim=11,hidden_dim=256,latent_dim=64):
@@ -88,18 +50,18 @@ class ConditionalVAE(nn.Module):
         return self.dec(torch.cat([torch.randn(c.shape[0],self.latent_dim,device=device),c],dim=-1))
 
 # ---- Load frozen encoder from K01 ----
-K01_CKPT_DIR=Path('/kaggle/input/datasets/mysteriousavailable/checkpoint-k01/checkpoints/D_mae_pretrain')
+K01_CKPT_DIR=Path('/kaggle/input/datasets/harshitpachahara/k01-output/checkpoints/D_mae_pretrain')
 ckpt=torch.load(K01_CKPT_DIR/'best.pt',map_location=device,weights_only=False)
-t2v=Time2Vec(k=16).to(device)
-enc=EGATv2Encoder(max_nodes=ckpt['max_nodes'], edge_dim=EDGE_DIM).to(device)
-t2v.load_state_dict(ckpt['t2v']); enc.load_state_dict(ckpt['encoder'])
+if 't2v' not in globals(): t2v = Time2Vec(k=16).to(device)
+enc=EGATv2Encoder(edge_dim=EDGE_DIM).to(device)
+t2v.load_state_dict(ckpt['t2v']); enc.load_state_dict(ckpt['encoder'])  # strict=True now works — same class
 for p in list(t2v.parameters())+list(enc.parameters()): p.requires_grad=False
 t2v.eval(); enc.eval()
 if torch.cuda.is_available():
     t2v.half(); enc.half()  # frozen + eval-only: half precision here is safe and roughly halves
     # VRAM for the dominant cost in this script (Pass 2's per-graph forward passes)
 T_MIN,T_MAX=ckpt['time_min'],ckpt['time_max']  # use K01's exact training-time bounds, not a recompute
-del ckpt; gc.collect()  # ckpt also carries K01's decoder weights we never use — free that RAM now
+del ckpt; gc.collect()  # ckpt also carries K01's decoder + mask_token weights we never use — free that RAM now
 
 DATASET_FILES=[INPUT_DIR/f'{ds}_train_list.pt' for ds in ['NF-CICIDS2018','NF-UNSW-NB15']]
 DATASET_FILES=[p for p in DATASET_FILES if p.exists()]
@@ -141,7 +103,7 @@ with torch.no_grad():
                     tn=(gd.edge_time-T_MIN)/(T_MAX-T_MIN)
                     if torch.cuda.is_available(): tn=tn.half()
                     te=t2v(tn)
-                    ef=torch.cat([gd.edge_attr.half() if torch.cuda.is_available() else gd.edge_attr,te],dim=-1)
+                    ef=torch.cat([gd.edge_attr.half() if torch.cuda.is_available() else gd.edge_attr, te],dim=-1)
                     reps=enc(Data(edge_index=gd.edge_index,edge_attr=ef,num_nodes=gd.num_nodes))
                     reps_min=reps[keep.to(device)]
                     min_embs.append(reps_min.half().cpu()); min_labels.append(y[keep])
@@ -167,8 +129,8 @@ print(f"Minority embeddings: {X_min.shape}")
 # ---- Train CVAE ----
 es=StandardScaler(); X_min_norm=torch.tensor(es.fit_transform(X_min.numpy()),dtype=torch.float32)
 
-cvae=ConditionalVAE(hidden_dim=512, latent_dim=128).to(device); opt=optim.Adam(cvae.parameters(),lr=5e-4)
-HP={'epochs':100,'bs':128,'beta':0.2}
+cvae=ConditionalVAE(hidden_dim=256, latent_dim=64).to(device); opt=optim.Adam(cvae.parameters(),lr=1e-3)
+HP={'epochs':150,'bs':256,'beta':0.05}
 sch=optim.lr_scheduler.CosineAnnealingLR(opt,T_max=HP['epochs'])
 
 print(f"Training CVAE ({HP['epochs']} epochs)...")
@@ -196,21 +158,11 @@ for ep in range(HP['epochs']):
         print(f"  Ep {ep+1:2d}: loss={avg_loss:.6f} recon_mse={avg_rl:.6f} kl={avg_kl:.6f} nan_batches={nan_b}")
 
 # ---- Generate synthetic embeddings ----
-# Target formula redesigned. Two problems with majority_ct*0.4:
-#  1. RAM: majority_ct can be huge (13M+), producing multi-million-row targets per class.
-#  2. QUALITY (the more important one): a CVAE trained on very few real samples produces
-#     degraded synthetic data at extreme oversampling ratios. Proven empirically in your last
-#     run — Web Attack (2,078 real) was asked for 200,000 synthetic (96x) and scored a 0.3988
-#     centroid distance, 4-10x worse than classes oversampled more modestly. That's the
-#     generator overfitting/mode-collapsing, not noise — training a classifier on that much
-#     near-duplicate synthetic data would teach it the CVAE's artifacts, not real attack
-#     patterns, hurting generalization on your blind test sets.
-# New approach: bring each minority class up toward the dataset MEDIAN class size (standard
-# balancing target, not an arbitrary fraction of the single largest class), capped at a max
-# oversampling ratio relative to the class's OWN real count (SMOTE-family literature typically
-# stays under ~10-15x; we use 10x as a safe default backed by the evidence above).
-MAX_OVERSAMPLE_RATIO=10  # don't generate more than 10x a class's real sample count
-MAX_SYNTH_PER_CLASS=200_000  # hard backstop regardless of the above, purely for RAM/disk safety
+# Bring each minority class up toward the dataset MEDIAN class size (standard balancing target),
+# capped at 10x a class's own real count (SMOTE-family literature stays under ~10-15x oversample
+# to avoid the generator overfitting/mode-collapsing on very few real samples).
+MAX_OVERSAMPLE_RATIO=10
+MAX_SYNTH_PER_CLASS=200_000
 needed_per_cls={}
 for cls in minority_cls:
     real_n=cls_counts.get(cls,0)

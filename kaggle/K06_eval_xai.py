@@ -15,10 +15,18 @@ from collections import defaultdict, Counter
 import warnings; warnings.filterwarnings('ignore')
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt; import seaborn as sns
-from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, confusion_matrix
+from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, confusion_matrix, classification_report
 from sklearn.manifold import TSNE
 
 import torch_geometric; from torch_geometric.nn import GATv2Conv; from torch_geometric.data import Data
+from torch_geometric.utils import degree
+import sys
+from pathlib import Path
+MODELS_PATH = Path('/kaggle/input/datasets/harshitpachahara/models-py')
+if MODELS_PATH.exists() and str(MODELS_PATH) not in sys.path:
+    sys.path.append(str(MODELS_PATH))
+from models import Time2Vec, EGATv2Encoder, ClassifierHead, FocalLoss
+
 
 # %% [cell 2] Seed & Paths
 SEED=42;random.seed(SEED);np.random.seed(SEED);torch.manual_seed(SEED)
@@ -35,78 +43,26 @@ with open(INPUT/'feature_manifest.yaml') as f:fm=yaml.safe_load(f)
 with open(INPUT/'label_map.yaml') as f:lm=yaml.safe_load(f)
 UNIFIED=lm['unified_classes'];N_CLASSES=len(UNIFIED);EDGE_DIM=fm['final_edge_input_dim']
 
-class Time2Vec(nn.Module):
-    def __init__(self,k=16):
-        super().__init__();self.k=k;self.w0=nn.Parameter(torch.randn(1)*0.1);self.b0=nn.Parameter(torch.zeros(1))
-        self.omega=nn.Parameter(10.0**(torch.rand(k)*6-3));self.bias=nn.Parameter(torch.zeros(k));self.output_dim=k+1
-    def forward(self,t):
-        if t.dim()==1:t=t.unsqueeze(-1)
-        return torch.cat([self.w0*t+self.b0,torch.sin(self.omega*t+self.bias)],dim=-1)
 
-class EGATv2Encoder(nn.Module):
-    def __init__(self, max_nodes, edge_dim=58, node_init=128, hidden=256, heads=8, layers=3,
-                 d_attn=0.3, d_feat=0.2, return_attention=False):
-        super().__init__()
-        assert max_nodes is not None and max_nodes > 0, "max_nodes must be a positive int"
-        self.hidden=hidden; self.heads=heads; self.layers=layers
-        self.output_dim = hidden*3  # 768
-        self.node_init = node_init
-        self.max_nodes = max_nodes
-        self.return_attention = return_attention
 
-        self.node_embed = nn.Parameter(torch.randn(max_nodes, node_init) * 0.1)
-        self.edge_proj = nn.Linear(edge_dim, hidden)
-        self.convs = nn.ModuleList(); self.norms = nn.ModuleList()
-        self.dropout = nn.Dropout(d_feat)
-        for _ in range(layers):
-            self.convs.append(GATv2Conv((-1,-1), hidden//heads, heads=heads,
-                edge_dim=hidden, dropout=d_attn, concat=True))
-            self.norms.append(nn.LayerNorm(hidden))
-        self.activation = nn.ELU()
 
-    def forward(self, data, return_attn=False):
-        n = data.num_nodes
-        table_size = self.node_embed.shape[0]
-        if n <= table_size:
-            x = self.node_embed[:n]
-        else:
-            idx = torch.arange(n, device=self.node_embed.device) % table_size
-            x = self.node_embed[idx]
-        ea = self.edge_proj(data.edge_attr)
-        all_attn = []
-        for conv, norm in zip(self.convs, self.norms):
-            if return_attn or self.return_attention:
-                x_new, attn = conv(x, data.edge_index, edge_attr=ea, return_attention_weights=True)
-                all_attn.append(attn)
-            else:
-                x_new = conv(x, data.edge_index, edge_attr=ea)
-            x_new = self.activation(x_new); x_new = self.dropout(x_new)
-            x = norm(x + x_new) if x.shape == x_new.shape else norm(x_new)
-        out = torch.cat([x[data.edge_index[0]], x[data.edge_index[1]], ea], dim=-1)
-        return (out, all_attn) if (return_attn or self.return_attention) else out
-
-class BinaryHead(nn.Module):
-    def __init__(self):super().__init__();self.net=nn.Sequential(nn.Linear(768,256),nn.ELU(),nn.Dropout(0.3),nn.Linear(256,64),nn.ELU(),nn.Dropout(0.2),nn.Linear(64,2))
-    def forward(self,x):return self.net(x)
-
-class MulticlassHead(nn.Module):
-    def __init__(self,nc=11):super().__init__();self.net=nn.Sequential(nn.Linear(768,256),nn.ELU(),nn.Dropout(0.3),nn.Linear(256,nc))
-    def forward(self,x):return self.net(x)
 
 # Load checkpoints
-ckpt_f=torch.load(WORKING/'checkpoints'/'F_binary'/'best.pt',map_location=device,weights_only=False)
-ckpt_g=torch.load(WORKING/'checkpoints'/'G_multiclass'/'best.pt',map_location=device,weights_only=False)
+K03_CKPT = Path('/kaggle/input/datasets/harshitpachahara/k03-output/checkpoints/F_binary/best.pt')
+K04_CKPT = Path('/kaggle/input/datasets/harshitpachahara/k04-output/checkpoints/G_multiclass/best.pt')
+ckpt_f=torch.load(K03_CKPT,map_location=device,weights_only=False)
+ckpt_g=torch.load(K04_CKPT,map_location=device,weights_only=False)
 
-t2v=Time2Vec(k=16).to(device)
-enc_max_nodes = ckpt_g['encoder']['node_embed'].shape[0]
-encoder=EGATv2Encoder(max_nodes=enc_max_nodes, edge_dim=EDGE_DIM).to(device)
-bin_head=BinaryHead().to(device);multi_head=MulticlassHead(nc=N_CLASSES).to(device)
+if 't2v' not in globals(): t2v = Time2Vec(k=16).to(device)
+if 'encoder' not in globals(): encoder = EGATv2Encoder(edge_dim=EDGE_DIM).to(device)
+if 'bin_head' not in globals(): bin_head = ClassifierHead(out_dim=2).to(device);multi_head=ClassifierHead(out_dim=N_CLASSES).to(device)
 t2v.load_state_dict(ckpt_g['t2v']);encoder.load_state_dict(ckpt_g['encoder'],strict=False)
 bin_head.load_state_dict(ckpt_f['head']);multi_head.load_state_dict(ckpt_g['head'])
 for m in [t2v,encoder,bin_head,multi_head]:
     for p in m.parameters():p.requires_grad=False;m.eval()
 
-with open(WORKING/'checkpoints'/'F_binary'/'threshold.json') as f:bin_thr=json.load(f)['threshold']
+K03_DIR = Path('/kaggle/input/datasets/harshitpachahara/k03-output/checkpoints/F_binary')
+with open(K03_DIR/'threshold.json') as f:bin_thr=json.load(f)['threshold']
 with open(WORKING/'checkpoints'/'G_multiclass'/'thresholds.json') as f:per_cls_thr=json.load(f)['per_class_thresholds']
 
 # Time normalizer — load saved values from training checkpoint
@@ -114,7 +70,7 @@ TMIN=ckpt_g['time_min'];TMAX=ckpt_g['time_max']
 def nt(t):return(t-TMIN)/(TMAX-TMIN)
 
 def encode(ea,et,ei,nn):
-    tn=nt(et);te=t2v(tn);ea58=torch.cat([ea,te],dim=-1)
+    tn=nt(et.float());te=t2v(tn);ea58=torch.cat([ea.float(),te],dim=-1)
     return Data(edge_index=ei,edge_attr=ea58,num_nodes=nn)
 
 def load_graphs(n,s):
@@ -127,7 +83,8 @@ gc.collect(); torch.cuda.empty_cache()  # clean up after torch.load
 test_preds,test_targets=[],[]
 with torch.no_grad():
     for g in G_test:
-        g=g.to(device);reps=encoder(encode(g.edge_attr,g.edge_time,g.edge_index,g.num_nodes))
+        ei, ea, et, y = g.edge_index.to(device), g.edge_attr.float().to(device), g.edge_time.float().to(device), g.y.to(device)
+        reps=encoder(encode(ea,et,ei,g.num_nodes))
         bin_probs=F.softmax(bin_head(reps),-1);attack_mask=bin_probs[:,1]>=bin_thr
         preds=torch.zeros(reps.shape[0],dtype=torch.long,device=device)
         if attack_mask.any():
@@ -145,6 +102,7 @@ with torch.no_grad():
                 max_cls[below]=fallback[below]
             preds[attack_mask]=max_cls
         test_preds.extend(preds.cpu().tolist());test_targets.extend(g.y.cpu().tolist())
+test_targets=np.array(test_targets); test_preds=np.array(test_preds)
 in_domain_f1=f1_score(test_targets,test_preds,average='macro')
 print(f"In-domain Macro-F1: {in_domain_f1:.4f}")
 for i,cn in enumerate(UNIFIED):
@@ -167,8 +125,9 @@ for ds in ['NF-ToN-IoT','NF-BoT-IoT']:
     p,t=[],[]
     with torch.no_grad():
         for g in graphs:
-            g=g.to(device);reps=encoder(encode(g.edge_attr,g.edge_time,g.edge_index,g.num_nodes))
-            preds=multi_head(reps).argmax(-1);p.extend(preds.cpu().tolist());t.extend(g.y.cpu().tolist())
+            ei, ea, et, y = g.edge_index.to(device), g.edge_attr.float().to(device), g.edge_time.float().to(device), g.y.to(device)
+            reps=encoder(encode(ea,et,ei,g.num_nodes))
+            preds=multi_head(reps).argmax(-1);p.extend(preds.cpu().tolist());t.extend(y.cpu().tolist())
     mf1=f1_score(t,p,average='macro')
     print(f"  {ds}: Macro-F1={mf1:.4f}");cross_results.append({'dataset':ds,'schema':'in-schema','macro_f1':round(float(mf1),4)})
 cross_results.append({'dataset':'CIC-DDoS2019','schema':'out-of-schema','macro_f1':'N/A'})
@@ -197,15 +156,20 @@ for g in G_test[:5]:
         idx=torch.randperm(g.edge_index.shape[1])[:n_per];g.edge_index=g.edge_index[:,idx];g.edge_attr=g.edge_attr[idx];g.edge_time=g.edge_time[idx];g.y=g.y[idx]
     G_test_sub.append(g)
 
-fmins=torch.cat([torch.full((41,),-4.0),torch.full((17,),-4.0)]).to(device)
-fmaxs=torch.cat([torch.full((41,),4.0),torch.full((17,),4.0)]).to(device)
+fmins_41=torch.full((41,), float('inf'))
+fmaxs_41=torch.full((41,),-float('inf'))
+for g in G_test_sub:
+    fmins_41=torch.min(fmins_41,g.edge_attr.min(dim=0).values)
+    fmaxs_41=torch.max(fmaxs_41,g.edge_attr.max(dim=0).values)
+fmins=torch.cat([fmins_41,torch.full((17,),-4.0)]).to(device)
+fmaxs=torch.cat([fmaxs_41,torch.full((17,),4.0)]).to(device)
 rob_results=[]
 
 for eps in [0.0,0.01,0.03,0.05]:
     ap,at=[],[]
     for g in G_test_sub:
-        g=g.to(device)
-        ea58=encode(g.edge_attr,g.edge_time,g.edge_index,g.num_nodes).edge_attr
+        ei, ea, et, y = g.edge_index.to(device), g.edge_attr.to(device), g.edge_time.to(device), g.y.to(device)
+        ea58=encode(ea,et,ei,g.num_nodes).edge_attr
         if eps>0:
             ea58_orig=ea58.clone()
             for _ in range(7):
@@ -393,3 +357,4 @@ log={'notebook':'K06','stages':['I','J'],'in_domain_f1':float(in_domain_f1),
      'cross_dataset':cross_results,'adversarial':rob_results,'per_flow_ms':float(per_flow)}
 with open(LOGS_DIR/'k06_log.json','w') as f:json.dump(log,f,indent=2)
 print(f"\nK06 COMPLETE. Pipeline end-to-end finished.")
+

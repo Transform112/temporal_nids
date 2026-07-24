@@ -15,12 +15,14 @@ import warnings; warnings.filterwarnings('ignore')
 import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_curve, auc, precision_recall_curve, average_precision_score
 import torch_geometric; from torch_geometric.nn import GATv2Conv; from torch_geometric.data import Data
+from torch_geometric.utils import degree
 
 # %% [cell 2]
 SEED=42;random.seed(SEED);np.random.seed(SEED);torch.manual_seed(SEED)
 if torch.cuda.is_available():torch.cuda.manual_seed_all(SEED)
 
 WORKING=Path('../working');INPUT = Path('/kaggle/input/datasets/mysteriousavailable/ids-nf3-processed/ids-nf3-processed')
+CKPT_DIR=WORKING/'checkpoints'/'H_prototypical'; LOGS_DIR=WORKING/'logs'; FIGS_DIR=WORKING/'outputs'/'figures'; TABS_DIR=WORKING/'outputs'/'tables'
 for d in [CKPT_DIR,LOGS_DIR,FIGS_DIR,TABS_DIR]:d.mkdir(parents=True,exist_ok=True)
 device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -29,59 +31,12 @@ with open(INPUT/'feature_manifest.yaml') as f:fm=yaml.safe_load(f)
 with open(INPUT/'label_map.yaml') as f:lm=yaml.safe_load(f)
 UNIFIED=lm['unified_classes'];N_CLASSES=len(UNIFIED);EDGE_DIM=fm['final_edge_input_dim']
 
-class Time2Vec(nn.Module):
-    def __init__(self,k=16):
-        super().__init__();self.k=k;self.w0=nn.Parameter(torch.randn(1)*0.1)
-        self.b0=nn.Parameter(torch.zeros(1));self.omega=nn.Parameter(10.0**(torch.rand(k)*6-3))
-        self.bias=nn.Parameter(torch.zeros(k));self.output_dim=k+1
-    def forward(self,t):
-        if t.dim()==1:t=t.unsqueeze(-1)
-        return torch.cat([self.w0*t+self.b0,torch.sin(self.omega*t+self.bias)],dim=-1)
 
-class EGATv2Encoder(nn.Module):
-    def __init__(self, max_nodes, edge_dim=58, node_init=128, hidden=256, heads=8, layers=3,
-                 d_attn=0.3, d_feat=0.2, return_attention=False):
-        super().__init__()
-        assert max_nodes is not None and max_nodes > 0, "max_nodes must be a positive int"
-        self.hidden=hidden; self.heads=heads; self.layers=layers
-        self.output_dim = hidden*3  # 768
-        self.node_init = node_init
-        self.max_nodes = max_nodes
-        self.return_attention = return_attention
-
-        self.node_embed = nn.Parameter(torch.randn(max_nodes, node_init) * 0.1)
-        self.edge_proj = nn.Linear(edge_dim, hidden)
-        self.convs = nn.ModuleList(); self.norms = nn.ModuleList()
-        self.dropout = nn.Dropout(d_feat)
-        for _ in range(layers):
-            self.convs.append(GATv2Conv((-1,-1), hidden//heads, heads=heads,
-                edge_dim=hidden, dropout=d_attn, concat=True))
-            self.norms.append(nn.LayerNorm(hidden))
-        self.activation = nn.ELU()
-
-    def forward(self, data):
-        n = data.num_nodes
-        table_size = self.node_embed.shape[0]
-        if n <= table_size:
-            x = self.node_embed[:n]
-        else:
-            idx = torch.arange(n, device=self.node_embed.device) % table_size
-            x = self.node_embed[idx]
-        ea = self.edge_proj(data.edge_attr)
-        for conv, norm in zip(self.convs, self.norms):
-            if self.return_attention:
-                x_new, _ = conv(x, data.edge_index, edge_attr=ea, return_attention_weights=True)
-            else:
-                x_new = conv(x, data.edge_index, edge_attr=ea)
-            x_new = self.activation(x_new); x_new = self.dropout(x_new)
-            x = norm(x + x_new) if x.shape == x_new.shape else norm(x_new)
-        return torch.cat([x[data.edge_index[0]], x[data.edge_index[1]], ea], dim=-1)
 
 # %% [cell 4] Load frozen encoder + extract embeddings
 ckpt_g=torch.load(WORKING/'checkpoints'/'G_multiclass'/'best.pt',map_location=device,weights_only=False)
-t2v=Time2Vec(k=16).to(device)
-enc_max_nodes = ckpt_g['encoder']['node_embed'].shape[0]
-encoder=EGATv2Encoder(max_nodes=enc_max_nodes, edge_dim=EDGE_DIM).to(device)
+if 't2v' not in globals(): t2v = Time2Vec(k=16).to(device)
+if 'encoder' not in globals(): encoder = EGATv2Encoder(edge_dim=EDGE_DIM).to(device)
 t2v.load_state_dict(ckpt_g['t2v']);encoder.load_state_dict(ckpt_g['encoder'],strict=False)
 for p in list(t2v.parameters())+list(encoder.parameters()):p.requires_grad=False
 t2v.eval();encoder.eval()
@@ -93,13 +48,21 @@ def extract_embeddings(graph_list):
     embs,lbls=[],[]
     with torch.no_grad():
         for g in graph_list:
-            g=g.to(device);tn=(g.edge_time-TMIN)/(TMAX-TMIN);te=t2v(tn)
-            ea58=torch.cat([g.edge_attr,te],dim=-1)
-            d=Data(edge_index=g.edge_index,edge_attr=ea58,num_nodes=g.num_nodes)
+            ei,ea,et = g.edge_index.to(device),g.edge_attr.float().to(device),g.edge_time.float().to(device)
+            tn=(et-TMIN)/(TMAX-TMIN);te=t2v(tn)
+            ea58=torch.cat([ea,te],dim=-1)
+            d=Data(edge_index=ei,edge_attr=ea58,num_nodes=g.num_nodes)
             embs.append(encoder(d).cpu());lbls.append(g.y.cpu())
     return torch.cat(embs,dim=0),torch.cat(lbls,dim=0)
 
 import gc
+import sys
+from pathlib import Path
+MODELS_PATH = Path('/kaggle/input/datasets/harshitpachahara/models-py')
+if MODELS_PATH.exists() and str(MODELS_PATH) not in sys.path:
+    sys.path.append(str(MODELS_PATH))
+from models import Time2Vec, EGATv2Encoder, ClassifierHead, FocalLoss
+
 
 # Load, extract, delete sequentially to keep RAM low
 print("Extracting train embeddings...")
@@ -151,10 +114,27 @@ HP={'n_way':5,'n_shot':5,'n_query':15,'ep_per_epoch':200,'epochs':30,'lr':1e-4}
 pn=ProtoNet().to(device);opt=optim.Adam(pn.parameters(),lr=HP['lr'])
 sched=optim.lr_scheduler.CosineAnnealingLR(opt,T_max=HP['epochs'])
 
-train_accs,val_accs=[]; best_val_acc = 0.0
+train_accs,val_accs=[],[]; best_val_acc = 0.0
 print(f"Prototypical training: {HP['epochs']} epochs, {HP['ep_per_epoch']} eps/epoch")
 
-for epoch in range(HP['epochs']):
+
+# Resume from checkpoint if exists
+if (CKPT_DIR / 'best.pt').exists():
+    print(f'Resuming training from {CKPT_DIR / "best.pt"}')
+    ckpt = torch.load(CKPT_DIR / 'best.pt', map_location=device, weights_only=False)
+    if 'model' in ckpt: pn.load_state_dict(ckpt['model'])
+    if 'opt' in ckpt: opt.load_state_dict(ckpt['opt'])
+    if 'sched' in ckpt: sched.load_state_dict(ckpt['sched'])
+    if 'epoch' in ckpt: start_epoch = ckpt['epoch'] + 1
+    else: start_epoch = 0
+    if 'val_accs' in ckpt and len(ckpt['val_accs']) > 0: 
+        best_val_acc = ckpt['val_accs'][-1]
+        val_accs = ckpt['val_accs']
+    if 'train_accs' in ckpt: train_accs = ckpt['train_accs']
+else:
+    start_epoch = 0
+
+for epoch in range(start_epoch, HP['epochs']):
     pn.train();ea=0.0
     for _ in range(HP['ep_per_epoch']):
         cls_sample=random.sample(attack_classes,HP['n_way'])
@@ -197,7 +177,8 @@ for epoch in range(HP['epochs']):
     print(f"Epoch {epoch+1:2d}: Train={train_accs[-1]:.4f} Val={val_accs[-1]:.4f}")
     if val_accs[-1] > best_val_acc:
         best_val_acc = val_accs[-1]
-        torch.save({'model':pn.state_dict(),'train_accs':train_accs,'val_accs':val_accs,'config':HP},CKPT_DIR/'best.pt')
+        torch.save({'model':pn.state_dict(),'opt':opt.state_dict(),'sched':sched.state_dict(),'epoch':epoch,
+                    'train_accs':train_accs,'val_accs':val_accs,'config':HP},CKPT_DIR/'best.pt')
 
 # %% [cell 7] Leave-One-Class-Out Novelty Threshold Tuning
 pn.eval()
@@ -288,3 +269,4 @@ pd.DataFrame(locoo_results).to_markdown(TABS_DIR/'tab09_zero_day_results.md',ind
 
 with open(CKPT_DIR/'tau.json','w') as f:json.dump({'global_tau':float(best_tau),'roc_auc':float(roc_auc),'ap':float(ap)},f)
 print(f"\nK05 DONE. AUC: {roc_auc:.4f}, AP: {ap:.4f}. Next: K06 (Eval+XAI)")
+
